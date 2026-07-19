@@ -68,7 +68,8 @@ jobs:
           python convert_to_coreml.py \
             --checkpoint checkpoints/best.pt \
             --out SwipeAnnotator.mlpackage \
-            --min_ios iOS26
+            --min_ios iOS26 \
+            --img_size 128
           xcrun coremlcompiler compile SwipeAnnotator.mlpackage .
           test -d SwipeAnnotator.mlmodelc || { echo "ERROR: SwipeAnnotator.mlmodelc was not produced"; exit 1; }
           echo "Model compiled:"
