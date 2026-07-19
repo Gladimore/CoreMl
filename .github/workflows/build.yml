@@ -29,6 +29,11 @@ jobs:
           restore-keys: |
             theos-${{ runner.os }}-
 
+      - name: Install packaging tools (dpkg, fakeroot)
+        run: |
+          set -euo pipefail
+          brew install dpkg fakeroot
+
       - name: Install Theos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -78,6 +83,7 @@ jobs:
       - name: Build tweak
         run: |
           set -euo pipefail
+          which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
           make clean || true
           make FINALPACKAGE=1 V=1
 
@@ -85,9 +91,11 @@ jobs:
         id: find_deb
         run: |
           set -euo pipefail
-          DEB_PATH=$(find packages -name '*.deb' | head -n1)
+          ls -la packages/ 2>/dev/null || echo "packages/ directory does not exist — packaging step did not run or failed silently"
+          DEB_PATH=$(find packages -name '*.deb' 2>/dev/null | head -n1)
           if [ -z "$DEB_PATH" ]; then
-            echo "ERROR: no .deb produced under packages/"; exit 1
+            echo "ERROR: no .deb produced under packages/. Check the 'Build tweak' step log above for dpkg-deb errors."
+            exit 1
           fi
           echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
 
