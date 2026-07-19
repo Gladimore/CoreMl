@@ -1,0 +1,9 @@
+Package: com.yourname.aiplayer
+Name: AIPlayer
+Version: 1.0
+Architecture: iphoneos-arm64
+Description: AI autoplay for Subway Surfers
+Maintainer: Josiah
+Author: Josiah
+Section: Tweaks
+Depends: mobilesubstrate

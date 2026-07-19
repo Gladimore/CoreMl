@@ -1,0 +1,105 @@
+name: Build AIPlayer
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Theos SDKs
+        uses: actions/cache@v4
+        with:
+          path: ~/theos/sdks
+          key: theos-sdks-${{ runner.os }}-v1
+
+      - name: Cache Theos core
+        uses: actions/cache@v4
+        with:
+          path: ~/theos
+          key: theos-${{ runner.os }}-${{ hashFiles('**/Makefile') }}-v1
+          restore-keys: |
+            theos-${{ runner.os }}-
+
+      - name: Install Theos
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          bash -c "$(curl -fsSL https://raw.githubusercontent.com/theos/theos/master/bin/install-theos)"
+          if [ -d "$HOME/theos" ]; then
+            echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+            echo "$HOME/theos/bin"   >> "$GITHUB_PATH"
+          else
+            echo "ERROR: Theos not found"; exit 1
+          fi
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Core ML conversion dependencies
+        run: |
+          set -euo pipefail
+          pip install torch coremltools
+
+      # ── Checkpoint -> Core ML ────────────────────────────────────────────
+      # Produces SwipeAnnotator.mlmodelc in the repo root. The Makefile's
+      # GrayHueCapture_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies
+      # it into the tweak's resource bundle during `make`. This step MUST
+      # run before Build.
+      #
+      # --checkpoint points at checkpoints/best.pt, committed to this repo.
+      # If your checkpoint lives somewhere else (Kaggle, cloud storage),
+      # replace this with a download step that produces that same path
+      # before the conversion runs.
+      - name: Convert checkpoint to Core ML
+        run: |
+          set -euo pipefail
+          python convert_to_coreml.py \
+            --checkpoint checkpoints/best.pt \
+            --out SwipeAnnotator.mlpackage \
+            --min_ios iOS26
+          xcrun coremlcompiler compile SwipeAnnotator.mlpackage .
+          test -d SwipeAnnotator.mlmodelc || { echo "ERROR: SwipeAnnotator.mlmodelc was not produced"; exit 1; }
+          echo "Model compiled:"
+          du -sh SwipeAnnotator.mlmodelc
+
+      - name: Build tweak
+        run: |
+          set -euo pipefail
+          make clean || true
+          make FINALPACKAGE=1 V=1
+
+      - name: Locate build output
+        id: find_deb
+        run: |
+          set -euo pipefail
+          DEB_PATH=$(find packages -name '*.deb' | head -n1)
+          if [ -z "$DEB_PATH" ]; then
+            echo "ERROR: no .deb produced under packages/"; exit 1
+          fi
+          echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIPlayer-dylib
+          path: .theos/obj/arm64/AIPlayer.dylib
+          if-no-files-found: error
+
+      - name: Upload deb package
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIPlayer-deb
+          path: ${{ steps.find_deb.outputs.deb_path }}
+          if-no-files-found: error
