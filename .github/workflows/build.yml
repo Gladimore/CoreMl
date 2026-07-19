@@ -33,29 +33,50 @@ jobs:
         run: |
           set -euo pipefail
           brew install dpkg ldid
-          # NOTE: deliberately not installing fakeroot here. Homebrew's
-          # native arm64 build of fakeroot ships an arm64e-only
-          # libfakeroot.dylib, which crashes dyld on GitHub's Apple Silicon
-          # runners ("incompatible architecture (have 'arm64', need
-          # 'arm64e')"). Theos's deb.mk invokes packaging as
-          # `$(FAKEROOT) -r dpkg-deb ...` — overriding FAKEROOT to empty
-          # (see the `make package FAKEROOT=` below) makes that line run
-          # dpkg-deb directly, no fakeroot wrapper at all. fakeroot only
-          # fakes file ownership (root:root) in the resulting .deb; in this
-          # ephemeral CI container there's no real multi-user ownership to
-          # fake, and the sideloaded tweak installs identically either way.
-          #
-          # ldid IS required, though: Theos's default TARGET_CODESIGN for
-          # the iphone target is `ldid`, not Apple's codesign, even on a
-          # native macOS host (jailbroken devices need an ad-hoc/pseudo
-          # signature, not a real Apple identity). Without it, the
-          # "Signing" step in `make package` fails with a confusing
-          # "bash: -c: command not found" / Error 127 instead of a clear
-          # "ldid: command not found". Sanity-check it below the same way
-          # dpkg-deb is checked, in case a future Homebrew bottle has the
-          # same arm64/arm64e mismatch fakeroot had.
           which ldid
           ldid -h > /dev/null 2>&1 || { echo "ERROR: ldid installed but not runnable (check dyld arch errors above)"; exit 1; }
+
+          # NOTE: deliberately not brew-installing fakeroot. Homebrew's
+          # native arm64 build ships an arm64e-only libfakeroot.dylib, which
+          # crashes dyld on GitHub's Apple Silicon runners ("incompatible
+          # architecture (have 'arm64', need 'arm64e')").
+          #
+          # Theos's $(FAKEROOT) is NOT just "the fakeroot binary" -- it's
+          # $THEOS/bin/fakeroot.sh plus a -p <persistence-file> argument
+          # (see common.mk), and it's invoked throughout staging/signing,
+          # not only in deb.mk's packaging line. Blanking FAKEROOT= at the
+          # top-level `make` invocation makes ALL of those call sites see
+          # an empty value -- including a bare `$(FAKEROOT) -c` used during
+          # staging to close out the persistence file, which then becomes
+          # the literal token `-c` executed as a command, producing
+          # "bash: -c: command not found" / Error 127 inside `before-stage`,
+          # before the build ever reaches packaging.
+          #
+          # Fix: give Theos a working `fakeroot` on PATH instead of
+          # removing FAKEROOT globally. This ephemeral CI container has no
+          # real multi-user ownership to fake, so a shim that strips
+          # fakeroot's own flags/persistence args and execs the wrapped
+          # command directly is sufficient, and it keeps every internal
+          # $(FAKEROOT) call site -- staging, signing, and the final
+          # dpkg-deb packaging line -- working uniformly.
+          mkdir -p "$HOME/.local/bin"
+          # Piped through sed to strip the leading whitespace that YAML's
+          # block-scalar indentation would otherwise bake into the heredoc
+          # body (which would break the shebang line).
+          cat << 'EOF' | sed 's/^[[:space:]]*//' > "$HOME/.local/bin/fakeroot"
+          #!/bin/sh
+          while [ "$#" -gt 0 ]; do
+          case "$1" in
+          --) shift; break ;;
+          -i|-s|-p) shift 2 ;;
+          *) shift ;;
+          esac
+          done
+          exec "$@"
+          EOF
+          chmod +x "$HOME/.local/bin/fakeroot"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          which fakeroot
 
       - name: Install Theos
         env:
@@ -108,28 +129,13 @@ jobs:
           set -euo pipefail
           which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
           which ldid || echo "WARNING: ldid not on PATH — signing will fail"
+          which fakeroot || echo "WARNING: fakeroot shim not on PATH — staging/signing will fail"
           make clean || true
 
-          # Installing ldid did NOT fix the "bash: -c: command not found"
-          # failure on the Signing step — it reproduced byte-for-byte with
-          # ldid present on PATH. That means the broken token isn't coming
-          # from a missing tool, it's coming from how this project's
-          # Makefile config builds the codesign command line itself.
-          # `make -n` (dry-run) still fully expands recipe text, including
-          # $(shell ...) substitutions, without executing anything, so it
-          # should print the exact command that's failing. Remove this
-          # block once the cause is identified.
-          echo "::group::Dry run (make -n) — inspecting signing command"
-          make -n package FINALPACKAGE=1 FAKEROOT= V=1 > /tmp/dry-run.log 2>&1 || true
-          echo "----- lines mentioning ldid/codesign -----"
-          grep -n -iE 'ldid|codesign' /tmp/dry-run.log || echo "(no matches in dry-run output — see full log below)"
-          echo "----- full dry-run log -----"
-          cat /tmp/dry-run.log
-          echo "::endgroup::"
-
-          # FAKEROOT= (empty) skips fakeroot entirely — see note in the
-          # "Install packaging tools" step above for why.
-          make package FINALPACKAGE=1 FAKEROOT= V=1
+          # No FAKEROOT= override here — see note in the "Install packaging
+          # tools" step above for why blanking it globally broke staging.
+          # The shim on PATH lets Theos's own $(FAKEROOT) work as intended.
+          make package FINALPACKAGE=1 V=1
 
       - name: Locate build output
         id: find_deb
