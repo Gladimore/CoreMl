@@ -85,7 +85,7 @@ jobs:
           set -euo pipefail
           which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
           make clean || true
-          make FINALPACKAGE=1 V=1
+          make package FINALPACKAGE=1 V=1
 
       - name: Locate build output
         id: find_deb
