@@ -109,6 +109,24 @@ jobs:
           which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
           which ldid || echo "WARNING: ldid not on PATH — signing will fail"
           make clean || true
+
+          # Installing ldid did NOT fix the "bash: -c: command not found"
+          # failure on the Signing step — it reproduced byte-for-byte with
+          # ldid present on PATH. That means the broken token isn't coming
+          # from a missing tool, it's coming from how this project's
+          # Makefile config builds the codesign command line itself.
+          # `make -n` (dry-run) still fully expands recipe text, including
+          # $(shell ...) substitutions, without executing anything, so it
+          # should print the exact command that's failing. Remove this
+          # block once the cause is identified.
+          echo "::group::Dry run (make -n) — inspecting signing command"
+          make -n package FINALPACKAGE=1 FAKEROOT= V=1 > /tmp/dry-run.log 2>&1 || true
+          echo "----- lines mentioning ldid/codesign -----"
+          grep -n -iE 'ldid|codesign' /tmp/dry-run.log || echo "(no matches in dry-run output — see full log below)"
+          echo "----- full dry-run log -----"
+          cat /tmp/dry-run.log
+          echo "::endgroup::"
+
           # FAKEROOT= (empty) skips fakeroot entirely — see note in the
           # "Install packaging tools" step above for why.
           make package FINALPACKAGE=1 FAKEROOT= V=1
