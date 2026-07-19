@@ -29,10 +29,10 @@ jobs:
           restore-keys: |
             theos-${{ runner.os }}-
 
-      - name: Install packaging tools (dpkg)
+      - name: Install packaging tools (dpkg, ldid)
         run: |
           set -euo pipefail
-          brew install dpkg
+          brew install dpkg ldid
           # NOTE: deliberately not installing fakeroot here. Homebrew's
           # native arm64 build of fakeroot ships an arm64e-only
           # libfakeroot.dylib, which crashes dyld on GitHub's Apple Silicon
@@ -44,6 +44,18 @@ jobs:
           # fakes file ownership (root:root) in the resulting .deb; in this
           # ephemeral CI container there's no real multi-user ownership to
           # fake, and the sideloaded tweak installs identically either way.
+          #
+          # ldid IS required, though: Theos's default TARGET_CODESIGN for
+          # the iphone target is `ldid`, not Apple's codesign, even on a
+          # native macOS host (jailbroken devices need an ad-hoc/pseudo
+          # signature, not a real Apple identity). Without it, the
+          # "Signing" step in `make package` fails with a confusing
+          # "bash: -c: command not found" / Error 127 instead of a clear
+          # "ldid: command not found". Sanity-check it below the same way
+          # dpkg-deb is checked, in case a future Homebrew bottle has the
+          # same arm64/arm64e mismatch fakeroot had.
+          which ldid
+          ldid -h > /dev/null 2>&1 || { echo "ERROR: ldid installed but not runnable (check dyld arch errors above)"; exit 1; }
 
       - name: Install Theos
         env:
@@ -95,6 +107,7 @@ jobs:
         run: |
           set -euo pipefail
           which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
+          which ldid || echo "WARNING: ldid not on PATH — signing will fail"
           make clean || true
           # FAKEROOT= (empty) skips fakeroot entirely — see note in the
           # "Install packaging tools" step above for why.
