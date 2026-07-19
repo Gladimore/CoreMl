@@ -29,10 +29,21 @@ jobs:
           restore-keys: |
             theos-${{ runner.os }}-
 
-      - name: Install packaging tools (dpkg, fakeroot)
+      - name: Install packaging tools (dpkg)
         run: |
           set -euo pipefail
-          brew install dpkg fakeroot
+          brew install dpkg
+          # NOTE: deliberately not installing fakeroot here. Homebrew's
+          # native arm64 build of fakeroot ships an arm64e-only
+          # libfakeroot.dylib, which crashes dyld on GitHub's Apple Silicon
+          # runners ("incompatible architecture (have 'arm64', need
+          # 'arm64e')"). Theos's deb.mk invokes packaging as
+          # `$(FAKEROOT) -r dpkg-deb ...` — overriding FAKEROOT to empty
+          # (see the `make package FAKEROOT=` below) makes that line run
+          # dpkg-deb directly, no fakeroot wrapper at all. fakeroot only
+          # fakes file ownership (root:root) in the resulting .deb; in this
+          # ephemeral CI container there's no real multi-user ownership to
+          # fake, and the sideloaded tweak installs identically either way.
 
       - name: Install Theos
         env:
@@ -85,7 +96,9 @@ jobs:
           set -euo pipefail
           which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
           make clean || true
-          make package FINALPACKAGE=1 V=1
+          # FAKEROOT= (empty) skips fakeroot entirely — see note in the
+          # "Install packaging tools" step above for why.
+          make package FINALPACKAGE=1 FAKEROOT= V=1
 
       - name: Locate build output
         id: find_deb
