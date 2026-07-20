@@ -99,7 +99,19 @@ jobs:
       - name: Install Core ML conversion dependencies
         run: |
           set -euo pipefail
-          pip install torch coremltools
+          # torch pinned to 2.7.0 -- coremltools' own warning during
+          # conversion flagged that 2.13.0 (latest at the time this was
+          # written) "has not been tested with coremltools", and 2.7.0 as
+          # "the most recent version that has been tested". That mismatch
+          # is the likely cause of a real failure we hit: `coremlcompiler`
+          # errored out compiling MIL to the BNNS graph backend with
+          # "Unsupported opset for gather op" -- almost certainly because a
+          # too-new torch traced an op shape/pattern (from indexing the
+          # GRU's hidden state, e.g. h_fast_new[-1]) that this coremltools
+          # version's BNNS backend doesn't yet recognize. If you bump this
+          # pin later, re-verify the compiled .mlmodelc actually loads
+          # (see the sanity-check step below) before trusting it.
+          pip install torch==2.7.0 coremltools
 
       # ── Checkpoint -> Core ML ────────────────────────────────────────────
       # Produces SwipeAnnotator.mlmodelc in the repo root. The Makefile's
@@ -119,10 +131,60 @@ jobs:
             --out SwipeAnnotator.mlpackage \
             --min_ios iOS26 \
             --img_size 128
-          xcrun coremlcompiler compile SwipeAnnotator.mlpackage .
+
+          # `xcrun coremlcompiler compile` can print "Error(s) occurred
+          # compiling MIL to BNNS graph" and still exit 0, still producing a
+          # SwipeAnnotator.mlmodelc directory -- BNNS graph is an optional
+          # fast execution path, and coremlcompiler doesn't always treat a
+          # failure to build it as fatal to the overall compile. That let a
+          # broken model sail straight through the old `test -d` check
+          # below, get packaged, and fail silently on-device instead of
+          # here. Capture the compiler's output explicitly and treat any
+          # "error" text as fatal regardless of exit code, since the exit
+          # code alone isn't trustworthy for this failure mode.
+          xcrun coremlcompiler compile SwipeAnnotator.mlpackage . 2>&1 | tee /tmp/coremlcompiler.log
+          compiler_status=${PIPESTATUS[0]}
+          if [ "$compiler_status" -ne 0 ] || grep -qi "error" /tmp/coremlcompiler.log; then
+            echo "ERROR: coremlcompiler reported a failure (or nonzero exit) -- see log above."
+            exit 1
+          fi
+
           test -d SwipeAnnotator.mlmodelc || { echo "ERROR: SwipeAnnotator.mlmodelc was not produced"; exit 1; }
           echo "Model compiled:"
           du -sh SwipeAnnotator.mlmodelc
+
+          # Load-back sanity check: confirms the .mlmodelc is actually a
+          # valid, loadable model (not just a directory that happens to
+          # exist) by running one dummy forward pass through it. A
+          # structurally-broken graph fails here, in CI, instead of showing
+          # up as "model not loaded" / a hollow prediction on-device.
+          #
+          # Shapes below mirror the fixed --img_size 128 above and
+          # AIPlayer.xm's kHidden/kFastLayers/kSlowLayers constants
+          # (192/2/1, so slow_hidden = 192/2 = 96). If you change the
+          # architecture or img_size, update both this block and the
+          # matching constants in AIPlayer.xm together.
+          python3 - << 'PYEOF'
+          import coremltools as ct
+          import numpy as np
+
+          m = ct.models.MLModel("SwipeAnnotator.mlmodelc")
+          spec = m.get_spec()
+          print(f"Loaded OK. {len(spec.description.input)} inputs, {len(spec.description.output)} outputs.")
+
+          img = 128
+          inputs = {
+              "fast_frame": np.zeros((1, 2, img, img), dtype=np.float32),
+              "slow_frame": np.zeros((1, 2, img, img), dtype=np.float32),
+              "has_slow":   np.zeros((1,), dtype=np.float32),
+              "h_fast_in":  np.zeros((2, 1, 192), dtype=np.float32),
+              "h_slow_in":  np.zeros((1, 1, 96), dtype=np.float32),
+          }
+          out = m.predict(inputs)
+          for k, v in out.items():
+              print(f"  {k}: shape={np.array(v).shape}")
+          print("Dummy forward pass succeeded.")
+          PYEOF
 
       - name: Build tweak
         run: |
