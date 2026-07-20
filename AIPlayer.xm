@@ -35,7 +35,6 @@
 #import <objc/runtime.h>
 #include <math.h>
 #include <mach/mach_time.h>
-#include <IOKit/IOTypes.h>   // IOOptionBits — used by the IOHIDEvent digitizer declarations below
 
 // ── Model config — MUST match your checkpoint's arch dict + dataset meta ───
 static const NSInteger kImgSize     = 128;   // meta['img_size'] — CONFIRM against your dataset
@@ -287,6 +286,10 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // =============================================================================
 
 typedef double IOHIDFloat;
+typedef uint32_t IOOptionBits;   // real def is `typedef UInt32 IOOptionBits` in IOKit/IOTypes.h —
+                                 // declared by hand here because that header (via IOReturn.h /
+                                 // device_types.h) trips a Clang-modules-in-extern-C error on
+                                 // some SDK/toolchain combos. Same width, no header dependency.
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
