@@ -35,6 +35,7 @@
 #import <objc/runtime.h>
 #include <math.h>
 #include <mach/mach_time.h>
+#include <IOKit/IOTypes.h>   // IOOptionBits — used by the IOHIDEvent digitizer declarations below
 
 // ── Model config — MUST match your checkpoint's arch dict + dataset meta ───
 static const NSInteger kImgSize     = 128;   // meta['img_size'] — CONFIRM against your dataset
