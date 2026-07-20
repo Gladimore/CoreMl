@@ -2,9 +2,18 @@
 // AIPlayer.xm — standalone AI-only tweak.
 //
 // Shows a small floating "AI: OFF / AI: ON" button. Tapping it starts/stops
-// a screen-capture + Core ML inference loop. Currently LOGS predictions
-// (NSLog) rather than acting on them — touch injection is a separate,
-// not-yet-built piece (see the note near ai_processCapturedBuffer:).
+// a screen-capture + Core ML inference loop. Every high-confidence detection
+// is logged AND injected into the game as a synthesized swipe (see
+// TouchInjector below) — the button flashes gold for ~150ms each time a
+// swipe is actually sent, so you can visually confirm firing rate.
+//
+// TouchInjector uses undocumented IOHIDEvent digitizer APIs (the standard
+// jailbreak-tweak technique for synthetic touch input — see the class
+// comment for details and caveats). It only works on a jailbroken device
+// with SpringBoard-level HID access; it will silently no-op on stock iOS.
+// Validate against on-screen gameplay with AI: ON before trusting it in a
+// real run — these are private APIs with no stability guarantee across
+// iOS versions.
 //
 // PREPROCESSING CONTRACT — must exactly match build_dataset_v3_gpu.py:
 //   1. Resize to (kImgSize, kImgSize) via SQUARE STRETCH (not
@@ -25,6 +34,8 @@
 #import <CoreML/CoreML.h>
 #import <objc/runtime.h>
 #include <math.h>
+#include <mach/mach_time.h>
+#include <mach-o/dyld.h>
 
 // ── Model config — MUST match your checkpoint's arch dict + dataset meta ───
 static const NSInteger kImgSize     = 128;   // meta['img_size'] — CONFIRM against your dataset
@@ -36,6 +47,26 @@ static const NSInteger kSlowHidden  = kHidden / 2;
 static const NSInteger kSlowBranchEveryNTicks = 6;  // VALIDATE against SLOW_OFFSETS spacing
 static const float     kDetectionThreshold    = 0.80f;
 static const int       kTargetFPS             = 24;
+
+// ── Touch injection tuning ──────────────────────────────────────────────────
+// kInjectCooldown: minimum gap between two injected swipes. A single real
+// swipe can cross kDetectionThreshold on several consecutive ticks (the
+// model wasn't trained to emit a single spike), so without a cooldown one
+// physical swipe could fire multiple synthesized swipes in a row.
+//
+// 0.15s, not the original 0.35s guess — checked against a real swipes.csv
+// session (5778 labeled swipes): at 0.35s cooldown, 34% of genuine
+// consecutive swipe pairs in that session were closer together than the
+// cooldown window (median gap 0.50s, but a meaningful tail down to 0.125s
+// between two *different*-direction swipes back to back). 0.35s would have
+// silently dropped over a third of legitimate rapid inputs, not just
+// duplicate detections. 0.15s only sacrifices ~0.2% of that session's real
+// swipes and still clears kSwipeDuration below, so it can't cut off a swipe
+// still mid-flight. If your game's swipe cadence is denser than this
+// session's, re-derive this the same way against your own swipes.csv.
+static const NSTimeInterval kInjectCooldown  = 0.15;  // seconds
+static const NSTimeInterval kSwipeDuration   = 0.12;  // seconds — one synthesized swipe's down->up span
+static const CGFloat        kSwipeMagnitude  = 0.35;  // fraction of min(screen.width, screen.height)
 
 typedef NS_ENUM(NSInteger, SwipeDirection) {
     SwipeDirUp = 0, SwipeDirDown = 1, SwipeDirLeft = 2, SwipeDirRight = 3,
@@ -229,6 +260,120 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 @end
 
 // =============================================================================
+// MARK: - TouchInjector — synthesizes swipes via IOHIDEvent digitizer events
+//
+// This is the standard technique used across jailbreak-tweak touch-simulation
+// tools (e.g. STHIDEventGenerator-style utilities): build IOHIDEvent
+// "digitizer finger" events by hand and dispatch them straight into the HID
+// event system, the same path a real finger's events travel. There is no
+// public API for this — the declarations below are reconstructed from
+// widely-circulated reverse-engineering references, not an Apple header.
+//
+// Caveats (read before relying on this):
+//   • Undocumented/private. Field names, bit values, and behavior can change
+//     between iOS versions with no notice and no deprecation warning.
+//   • Requires SpringBoard-level HID access, which a system-injected dylib
+//     on a jailbroken device has — this will silently do nothing on stock
+//     iOS or in a sandboxed app.
+//   • kIOHIDDigitizerEventSenderID below is a commonly-reused placeholder
+//     sender ID, not something read from the real touchscreen driver on
+//     your specific device. It has worked broadly in practice, but if
+//     injected touches don't land, try clearing it (senderID 0) first.
+//
+// A synthetic swipe is dispatched as three phases, a few ms apart:
+//   1. finger down at the start point   (touch=YES, range=YES)
+//   2. a handful of interpolated moves  (touch=YES, range=YES)
+//   3. finger up at the end point       (touch=NO,  range=NO)
+// =============================================================================
+
+typedef double IOHIDFloat;
+typedef uint32_t IOOptionBits;   // real def is `typedef UInt32 IOOptionBits` in IOKit/IOTypes.h —
+                                 // declared by hand here because that header (via IOReturn.h /
+                                 // device_types.h) trips a Clang-modules-in-extern-C error on
+                                 // some SDK/toolchain combos. Same width, no header dependency.
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+
+extern "C" {
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
+    CFAllocatorRef allocator, uint64_t timeStamp, uint32_t index, uint32_t identity,
+    uint32_t eventMask, IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
+    IOHIDFloat tipPressure, IOHIDFloat twist, Boolean range, Boolean touch, IOOptionBits options);
+extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+}
+
+static const uint32_t kIOHIDDigitizerEventRange    = 1 << 0;
+static const uint32_t kIOHIDDigitizerEventTouch    = 1 << 1;
+static const uint32_t kIOHIDDigitizerEventPosition = 1 << 2;
+static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
+
+@interface TouchInjector : NSObject
++ (instancetype)sharedInjector;
+// start/end are in points, in the same coordinate space as UIScreen.mainScreen.bounds.
+- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
+@end
+
+@implementation TouchInjector {
+    IOHIDEventSystemClientRef _client;
+}
+
++ (instancetype)sharedInjector {
+    static TouchInjector *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ inst = [TouchInjector new]; });
+    return inst;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+        if (!_client) NSLog(@"[AIPlayer] TouchInjector: IOHIDEventSystemClientCreate returned NULL "
+                            @"(expected on a non-jailbroken device — injection will no-op)");
+    }
+    return self;
+}
+
+- (void)sendFingerEventAtPoint:(CGPoint)p touch:(BOOL)touch range:(BOOL)range identity:(uint32_t)identity {
+    if (!_client) return;
+    uint32_t mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition;
+    IOHIDEventRef event = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, mach_absolute_time(), 0, identity, mask,
+        p.x, p.y, 0, touch ? 1.0 : 0.0, 0, range, touch, 0);
+    if (!event) return;
+    IOHIDEventSetSenderID(event, kIOHIDDigitizerEventSenderID);
+    IOHIDEventSystemClientDispatchEvent(_client, event);
+    CFRelease(event);
+}
+
+// Runs the down->move->up sequence on a background queue via usleep, so this
+// call returns immediately and never blocks the capture callback that
+// triggered it.
+- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
+    static uint32_t identityCounter = 1000;   // arbitrary range, kept away from real-finger identities
+    uint32_t identity = identityCounter++;
+    const NSInteger steps = 8;
+    const NSTimeInterval stepInterval = duration / steps;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        [self sendFingerEventAtPoint:start touch:YES range:YES identity:identity];
+        for (NSInteger i = 1; i <= steps; i++) {
+            usleep((useconds_t)(stepInterval * 1e6));
+            CGFloat t = (CGFloat)i / steps;
+            CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
+                                     start.y + (end.y - start.y) * t);
+            [self sendFingerEventAtPoint:p touch:YES range:YES identity:identity];
+        }
+        usleep((useconds_t)(stepInterval * 1e6));
+        [self sendFingerEventAtPoint:end touch:NO range:NO identity:identity];
+    });
+}
+
+@end
+
+// =============================================================================
 // MARK: - Passthrough view (lets touches fall through to the game)
 // =============================================================================
 
@@ -244,10 +389,61 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // MARK: - Overlay: single start/stop button
 // =============================================================================
 
+// =============================================================================
+// MARK: - Resource bundle lookup
+//
+// Theos's `AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc` (see the
+// Makefile) stages the compiled model into a SEPARATE bundle at
+// "<jb root>/Library/Application Support/AIPlayer.bundle/" (Theos's default
+// _RESOURCE_DIRS destination — see theos/makefiles/instance/tweak.mk +
+// shared/bundle.mk), not alongside AIPlayer.dylib itself, which normally
+// lives under ".../Library/MobileSubstrate/DynamicLibraries/".
+//
+// [NSBundle bundleForClass:] returns the bundle containing the CODE, not
+// that separate resource bundle — that mismatch, not a broken model, was
+// the direct cause of "SwipeAnnotator.mlmodelc not found in bundle".
+//
+// This resolves the resource bundle's real path by asking dyld where
+// AIPlayer.dylib itself was actually loaded from, then substituting the
+// known suffix. That keeps this working across both rootful (/Library/...)
+// and rootless (e.g. /var/jb/Library/...) jailbreak layouts without
+// hardcoding either prefix — whatever prefix the loader used to find this
+// dylib is read directly from dyld, not guessed.
+// =============================================================================
+
+static NSString *AIPlayerDylibDirectory(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        NSString *path = [NSString stringWithUTF8String:name];
+        if ([path.lastPathComponent isEqualToString:@"AIPlayer.dylib"])
+            return path.stringByDeletingLastPathComponent;
+    }
+    return nil;
+}
+
+static NSBundle *AIPlayerResourceBundle(void) {
+    NSString *dylibDir = AIPlayerDylibDirectory();
+    if (!dylibDir) {
+        NSLog(@"[AIPlayer] Could not locate AIPlayer.dylib's own path via dyld");
+        return nil;
+    }
+    NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
+    NSString *jbRoot = [dylibDir hasSuffix:suffix]
+        ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
+        : dylibDir.stringByDeletingLastPathComponent;  // best-effort fallback if the layout differs
+    NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
+    NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+    if (!bundle) NSLog(@"[AIPlayer] No resource bundle found at expected path: %@", bundlePath);
+    return bundle;
+}
+
 @interface AIOverlayVC : UIViewController
 @property (nonatomic, strong) UIButton *toggleButton;
 @property (nonatomic, assign) BOOL isPlaying;
 @property (nonatomic, assign) NSInteger frameTick;
+@property (nonatomic, assign) CFTimeInterval lastInjectTime;
 @end
 
 @implementation AIOverlayVC
@@ -279,7 +475,7 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     [self.toggleButton addGestureRecognizer:drag];
 
     // Load the compiled model from this tweak's own resource bundle.
-    NSBundle *tweakBundle = [NSBundle bundleForClass:[InferenceEngine class]];
+    NSBundle *tweakBundle = AIPlayerResourceBundle();
     NSURL *modelURL = [tweakBundle URLForResource:@"SwipeAnnotator" withExtension:@"mlmodelc"];
     if (modelURL) {
         NSError *err = nil;
@@ -359,12 +555,56 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     }
 
     if (pred.detProbability >= kDetectionThreshold) {
-        NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f",
+        CFTimeInterval nowTime = CACurrentMediaTime();
+        if (nowTime - self.lastInjectTime < kInjectCooldown) {
+            // Still inside the previous swipe's cooldown window — almost
+            // certainly the same physical swipe crossing threshold on a
+            // second consecutive tick. Log it for visibility but don't
+            // double-fire.
+            NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f — suppressed (cooldown)",
+                  (long)pred.direction, pred.dirConfidence, pred.detProbability);
+            return;
+        }
+        self.lastInjectTime = nowTime;
+
+        NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f — injecting",
               (long)pred.direction, pred.dirConfidence, pred.detProbability);
-        // Touch injection goes here once built. For now: log-only, so you
-        // can validate predictions against on-screen gameplay before
-        // wiring in anything that actually acts on the game.
+        [self injectSwipeForDirection:pred.direction];
     }
+}
+
+- (void)injectSwipeForDirection:(SwipeDirection)dir {
+    CGSize screen = [UIScreen mainScreen].bounds.size;
+    CGPoint center = CGPointMake(screen.width / 2.0, screen.height / 2.0);
+    CGFloat mag = MIN(screen.width, screen.height) * kSwipeMagnitude;
+
+    CGPoint end = center;
+    switch (dir) {
+        case SwipeDirUp:    end = CGPointMake(center.x, center.y - mag); break;
+        case SwipeDirDown:  end = CGPointMake(center.x, center.y + mag); break;
+        case SwipeDirLeft:  end = CGPointMake(center.x - mag, center.y); break;
+        case SwipeDirRight: end = CGPointMake(center.x + mag, center.y); break;
+    }
+
+    [[TouchInjector sharedInjector] injectSwipeFrom:center to:end duration:kSwipeDuration];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf flashInjectionFeedback]; });
+}
+
+// Briefly flashes the toggle button gold so you can visually confirm firing
+// rate/timing against on-screen gameplay without reading the console.
+- (void)flashInjectionFeedback {
+    if (!self.isPlaying) return;
+    UIColor *playingColor = [UIColor colorWithRed:0.20 green:0.70 blue:0.35 alpha:0.95];
+    self.toggleButton.backgroundColor = [UIColor colorWithRed:0.95 green:0.75 blue:0.15 alpha:0.95];
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (strongSelf && strongSelf.isPlaying)
+            strongSelf.toggleButton.backgroundColor = playingColor;
+    });
 }
 
 @end

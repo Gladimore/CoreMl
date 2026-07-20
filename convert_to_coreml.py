@@ -3,9 +3,9 @@
 convert_to_coreml.py — Convert a CausalSwipeAnnotator checkpoint (.pt) into a
 Core ML .mlpackage for streaming, single-frame-per-tick inference.
 
-Run this on your Mac (coremltools' mlprogram/ANE toolchain requires macOS to
-be fully useful, and you'll want Xcode's coremlcompiler for the next step
-anyway). Requires: torch, coremltools.
+Run this on your Mac (coremltools' toolchain requires macOS to be fully
+useful, and you'll want Xcode's coremlcompiler for the next step anyway).
+Requires: torch, coremltools.
 
     pip install torch coremltools
 
@@ -19,6 +19,21 @@ Usage:
 recover it automatically from checkpoint['args']['img_size'] (train_causal.py
 saves the full argparse Namespace there); pass it explicitly if that lookup
 fails, e.g. because you trained with an older checkpoint format.
+
+FORMAT: this script now defaults to convert_to="neuralnetwork" (the legacy
+Core ML format), not "mlprogram". Reason: fast_gru/slow_gru are multi-layer
+nn.GRU modules, and coremltools' PyTorch->MIL lowering of a native
+multi-layer GRU produces a gather-shaped op that Core ML's newer BNNS Graph
+CPU backend (which is what any mlprogram model's CPU path compiles through,
+as of the WWDC24 BNNS Graph engine) does not support -- this is independent
+of the h_fast_new[-1] indexing bug fixed earlier in StepWrapper, and shows
+up at `xcrun coremlcompiler compile` time as "Unsupported opset for gather
+op" inside CreateBnnsGraphProgramFromMIL, producing a .mlmodelc directory
+that exists on disk but has no Manifest.json and fails to load. The
+neuralnetwork format routes GRU to BNNS's own dedicated, mature GRU layer
+type instead, sidestepping BNNS Graph and the gather op entirely. See
+--convert_to if you want to try mlprogram again later (e.g. once you can
+test against a newer BNNS Graph on real hardware).
 
 Output: an .mlpackage with 5 inputs / 4 outputs (see IO_SPEC below), ready to
 be compiled to .mlmodelc (see the printed instructions at the end) and loaded
@@ -84,7 +99,30 @@ class StepWrapper(nn.Module):
         mask = has_slow.view(1, 1, 1)
         h_slow_new = mask * h_slow_candidate + (1.0 - mask) * h_slow
 
-        fused = torch.cat([h_fast_new[-1], h_slow_new[-1]], dim=-1)
+        # NOTE: h_fast_new[-1] (negative-index tensor indexing) traces
+        # through torch.jit.trace as an advanced-indexing/gather-style op,
+        # which Core ML's BNNS Graph backend doesn't support --
+        # coremlcompiler fails with "Unsupported opset for gather op" and
+        # silently produces an incomplete .mlmodelc (present on disk, but
+        # missing Manifest.json and unloadable).
+        #
+        # .narrow() was tried as a fix and made things worse -- it hit an
+        # unrelated bug inside coremltools' own slice_by_index type
+        # inference (ValueError building the begin/end constant array).
+        # The actual fix doesn't need narrow() at all: fast_layers/
+        # slow_layers are static Python ints from the model's own config
+        # (not derived from a tensor's .shape at trace time), so a plain
+        # POSITIVE Python-int index -- h_fast_new[fast_layers - 1] --
+        # traces via aten::select (a basic, universally-supported single-
+        # index op), not the gather path that only negative/computed-tensor
+        # indices hit. No .narrow()/.squeeze() needed; positive indexing
+        # already drops the indexed dimension.
+        fast_layers = self.model.fast_layers
+        slow_layers = self.model.slow_layers
+        h_fast_last = h_fast_new[fast_layers - 1]
+        h_slow_last = h_slow_new[slow_layers - 1]
+
+        fused = torch.cat([h_fast_last, h_slow_last], dim=-1)
         fused = self.model.drop(fused)  # no-op in eval() anyway
 
         det_logits = self.model.det_head(fused).squeeze(-1)
@@ -114,11 +152,31 @@ def main():
     ap.add_argument('--out', default='SwipeAnnotator.mlpackage', help='Output .mlpackage path')
     ap.add_argument('--img_size', type=int, default=None,
                      help='Frame H=W. Auto-recovered from checkpoint args if omitted.')
-    ap.add_argument('--min_ios', default='iOS26',
-                     choices=['iOS16', 'iOS17', 'iOS18', 'iOS26'],
-                     help='minimum_deployment_target. Default iOS26 (matches a 26.5.2 device); '
-                          'lower this only if you also need older-device support.')
+    ap.add_argument('--convert_to', default='neuralnetwork',
+                     choices=['neuralnetwork', 'mlprogram'],
+                     help="Core ML format. Default 'neuralnetwork' -- routes the model's "
+                          "multi-layer GRUs to BNNS's dedicated GRU layer type instead of "
+                          "through the mlprogram/BNNS-Graph compile path that currently fails "
+                          "on 'gather' for this architecture (see module docstring). Only pass "
+                          "'mlprogram' if you're deliberately re-testing that path.")
+    ap.add_argument('--min_ios', default=None,
+                     choices=['iOS14', 'iOS15', 'iOS16', 'iOS17', 'iOS18', 'iOS26'],
+                     help='minimum_deployment_target. Default depends on --convert_to: '
+                          'iOS15 for neuralnetwork (matches the tweak\'s own iOS 15.0 Makefile '
+                          'TARGET; neuralnetwork does not support iOS17+ targets in coremltools), '
+                          'iOS26 for mlprogram. Only raise/lower this if you know what you need.')
     args = ap.parse_args()
+
+    if args.min_ios is None:
+        args.min_ios = 'iOS15' if args.convert_to == 'neuralnetwork' else 'iOS26'
+
+    if args.convert_to == 'neuralnetwork' and args.min_ios not in ('iOS14', 'iOS15', 'iOS16'):
+        print(f"[error] --convert_to neuralnetwork is incompatible with "
+              f"--min_ios {args.min_ios} (coremltools targets the neuralnetwork format at "
+              f"iOS14-16-era deployment targets only). Use --min_ios iOS15/iOS16, or drop "
+              f"--min_ios entirely to get the default, or switch to --convert_to mlprogram.",
+              file=sys.stderr)
+        sys.exit(1)
 
     print(f"[1/5] Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
@@ -153,10 +211,17 @@ def main():
     with torch.no_grad():
         traced = torch.jit.trace(wrapper, example, check_trace=True)
 
-    print("[4/5] Converting with coremltools")
+    print(f"[4/5] Converting with coremltools (convert_to={args.convert_to}, "
+          f"minimum_deployment_target={args.min_ios})")
     import coremltools as ct
 
     target = getattr(ct.target, args.min_ios)
+
+    # neuralnetwork ties execution precision to compute unit (CPU is always
+    # float32; there's no per-op ANE/GPU float16 path the way mlprogram has),
+    # but it still lets Core ML pick which unit runs each op at *runtime* --
+    # this is a static-graph-format choice, not a "force everything onto the
+    # CPU" choice. ComputeUnit.ALL is correct for both formats.
     mlmodel = ct.convert(
         traced,
         inputs=[
@@ -173,7 +238,7 @@ def main():
             ct.TensorType(name="h_slow_out"),
         ],
         minimum_deployment_target=target,
-        convert_to="mlprogram",
+        convert_to=args.convert_to,
         compute_units=ct.ComputeUnit.ALL,  # let Core ML pick ANE/GPU/CPU per-op
     )
 
@@ -207,6 +272,13 @@ Next steps
    indefinitely in step()/this export is an approximation of forward()'s
    fixed 8-frame window, not a mathematical identity. Compare traced-model
    logits against forward()-produced logits on a held-out session.
+
+5) This export used convert_to="{args.convert_to}". If that's "neuralnetwork":
+   CPU execution is always float32 there (mlprogram instead lets Core ML use
+   float16 on GPU/ANE, varying by hardware). Do a quick before/after logit
+   comparison against an mlprogram export if you had one working previously,
+   just to confirm nothing shifted enough to matter for your det/dir
+   thresholds -- unlikely to matter here, but cheap to check once.
 """)
 
 

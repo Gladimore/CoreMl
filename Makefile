@@ -6,7 +6,7 @@ include $(THEOS)/makefiles/common.mk
 TWEAK_NAME = AIPlayer
 
 AIPlayer_FILES = AIPlayer.xm
-AIPlayer_FRAMEWORKS = UIKit ReplayKit CoreImage QuartzCore CoreML
+AIPlayer_FRAMEWORKS = UIKit ReplayKit CoreImage QuartzCore CoreML IOKit
 AIPlayer_CFLAGS = -fobjc-arc -Wno-unused-parameter
 
 # Copies the whole SwipeAnnotator.mlmodelc DIRECTORY into AIPlayer.bundle at

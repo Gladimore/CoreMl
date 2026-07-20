@@ -29,6 +29,55 @@ jobs:
           restore-keys: |
             theos-${{ runner.os }}-
 
+      - name: Install packaging tools (dpkg, ldid)
+        run: |
+          set -euo pipefail
+          brew install dpkg ldid
+          which ldid
+          ldid -h > /dev/null 2>&1 || { echo "ERROR: ldid installed but not runnable (check dyld arch errors above)"; exit 1; }
+
+          # NOTE: deliberately not brew-installing fakeroot. Homebrew's
+          # native arm64 build ships an arm64e-only libfakeroot.dylib, which
+          # crashes dyld on GitHub's Apple Silicon runners ("incompatible
+          # architecture (have 'arm64', need 'arm64e')").
+          #
+          # Theos's $(FAKEROOT) is NOT just "the fakeroot binary" -- it's
+          # $THEOS/bin/fakeroot.sh plus a -p <persistence-file> argument
+          # (see common.mk), and it's invoked throughout staging/signing,
+          # not only in deb.mk's packaging line. Blanking FAKEROOT= at the
+          # top-level `make` invocation makes ALL of those call sites see
+          # an empty value -- including a bare `$(FAKEROOT) -c` used during
+          # staging to close out the persistence file, which then becomes
+          # the literal token `-c` executed as a command, producing
+          # "bash: -c: command not found" / Error 127 inside `before-stage`,
+          # before the build ever reaches packaging.
+          #
+          # Fix: give Theos a working `fakeroot` on PATH instead of
+          # removing FAKEROOT globally. This ephemeral CI container has no
+          # real multi-user ownership to fake, so a shim that strips
+          # fakeroot's own flags/persistence args and execs the wrapped
+          # command directly is sufficient, and it keeps every internal
+          # $(FAKEROOT) call site -- staging, signing, and the final
+          # dpkg-deb packaging line -- working uniformly.
+          mkdir -p "$HOME/.local/bin"
+          # Piped through sed to strip the leading whitespace that YAML's
+          # block-scalar indentation would otherwise bake into the heredoc
+          # body (which would break the shebang line).
+          cat << 'EOF' | sed 's/^[[:space:]]*//' > "$HOME/.local/bin/fakeroot"
+          #!/bin/sh
+          while [ "$#" -gt 0 ]; do
+          case "$1" in
+          --) shift; break ;;
+          -i|-s|-p) shift 2 ;;
+          *) shift ;;
+          esac
+          done
+          exec "$@"
+          EOF
+          chmod +x "$HOME/.local/bin/fakeroot"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          which fakeroot
+
       - name: Install Theos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -50,11 +99,33 @@ jobs:
       - name: Install Core ML conversion dependencies
         run: |
           set -euo pipefail
-          pip install torch coremltools
+          # torch pinned to 2.7.0 -- coremltools' own warning during
+          # conversion flagged that 2.13.0 (latest at the time this was
+          # written) "has not been tested with coremltools", and 2.7.0 as
+          # "the most recent version that has been tested". Keeping this
+          # pin regardless of the note below, since it's still good
+          # practice against coremltools compatibility warnings generally.
+          #
+          # UPDATED ROOT CAUSE NOTE: the "Unsupported opset for gather op"
+          # failure this comment used to blame on torch version / on
+          # h_fast_new[-1] indexing was actually a coremltools mlprogram
+          # limitation, not a torch-version or indexing issue: converting
+          # to convert_to="mlprogram" compiles CPU execution through Core
+          # ML's newer BNNS Graph engine, which doesn't yet support the
+          # gather-shaped op that coremltools' own PyTorch->MIL lowering
+          # produces for a *native multi-layer* nn.GRU (fast_gru/slow_gru
+          # are 2-layer/1-layer GRUs) -- independent of any indexing in our
+          # own StepWrapper code, and independent of which torch version
+          # did the tracing. convert_to_coreml.py now defaults to
+          # convert_to="neuralnetwork" instead, which routes GRU to BNNS's
+          # own dedicated GRU layer type and sidesteps BNNS Graph (and this
+          # failure mode) entirely. See convert_to_coreml.py's module
+          # docstring for the full explanation.
+          pip install torch==2.7.0 coremltools
 
       # ── Checkpoint -> Core ML ────────────────────────────────────────────
       # Produces SwipeAnnotator.mlmodelc in the repo root. The Makefile's
-      # GrayHueCapture_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies
+      # AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies
       # it into the tweak's resource bundle during `make`. This step MUST
       # run before Build.
       #
@@ -65,28 +136,116 @@ jobs:
       - name: Convert checkpoint to Core ML
         run: |
           set -euo pipefail
+          # convert_to_coreml.py now defaults to convert_to="neuralnetwork"
+          # (not passed explicitly here, so the script's own default
+          # applies). That format caps minimum_deployment_target at
+          # iOS14-16 in coremltools -- iOS26 (the old value here) is
+          # incompatible with neuralnetwork and the script will now exit 1
+          # rather than silently doing the wrong thing. iOS15 matches the
+          # tweak's own Makefile (TARGET = iphone:clang:latest:15.0), so
+          # that's what we pass.
           python convert_to_coreml.py \
             --checkpoint checkpoints/best.pt \
             --out SwipeAnnotator.mlpackage \
-            --min_ios iOS26
-          xcrun coremlcompiler compile SwipeAnnotator.mlpackage .
+            --min_ios iOS15 \
+            --img_size 128
+
+          # `xcrun coremlcompiler compile` can print "Error(s) occurred
+          # compiling MIL to BNNS graph" and still exit 0, still producing a
+          # SwipeAnnotator.mlmodelc directory -- BNNS graph is an optional
+          # fast execution path, and coremlcompiler doesn't always treat a
+          # failure to build it as fatal to the overall compile. That let a
+          # broken model sail straight through the old `test -d` check
+          # below, get packaged, and fail silently on-device instead of
+          # here. Capture the compiler's output explicitly and treat any
+          # "error" text as fatal regardless of exit code, since the exit
+          # code alone isn't trustworthy for this failure mode.
+          #
+          # NOTE: now that the model.mlpackage is neuralnetwork-format (see
+          # above), it shouldn't route through BNNS Graph/MIL at all, so
+          # this specific error text is not expected to appear anymore.
+          # Left in place as a defensive check either way -- if this ever
+          # does fire again, it means something upstream changed back to
+          # mlprogram (or a future coremltools routes neuralnetwork through
+          # a similar path), and it's exactly the failure mode we want CI
+          # to catch rather than silently package.
+          xcrun coremlcompiler compile SwipeAnnotator.mlpackage . 2>&1 | tee /tmp/coremlcompiler.log
+          compiler_status=${PIPESTATUS[0]}
+          if [ "$compiler_status" -ne 0 ] || grep -qi "error" /tmp/coremlcompiler.log; then
+            echo "ERROR: coremlcompiler reported a failure (or nonzero exit) -- see log above."
+            exit 1
+          fi
+
           test -d SwipeAnnotator.mlmodelc || { echo "ERROR: SwipeAnnotator.mlmodelc was not produced"; exit 1; }
           echo "Model compiled:"
           du -sh SwipeAnnotator.mlmodelc
 
+          # Load-back sanity check: confirms the .mlmodelc is actually a
+          # valid, loadable model (not just a directory that happens to
+          # exist) by running one dummy forward pass through it. A
+          # structurally-broken graph fails here, in CI, instead of showing
+          # up as "model not loaded" / a hollow prediction on-device.
+          #
+          # Uses ct.models.CompiledMLModel, not ct.models.MLModel --
+          # MLModel expects a .mlpackage/.mlmodel (it looks for
+          # Manifest.json, which compiled .mlmodelc bundles never have,
+          # compiled correctly or not). CompiledMLModel is the documented
+          # API for loading an already-compiled .mlmodelc directory
+          # directly, which is exactly what we have at this point.
+          #
+          # Shapes below mirror the fixed --img_size 128 above and
+          # AIPlayer.xm's kHidden/kFastLayers/kSlowLayers constants
+          # (192/2/1, so slow_hidden = 192/2 = 96). If you change the
+          # architecture or img_size, update both this block and the
+          # matching constants in AIPlayer.xm together.
+          # Piped through sed to strip the leading whitespace YAML's block-
+          # scalar indentation bakes into this heredoc body (same trick as
+          # the fakeroot shim above). Written with no nested Python blocks
+          # (the per-output print uses a dict comprehension instead of a
+          # `for` loop body) so a flat strip-to-column-0 is safe here --
+          # unlike a `for`/`if` body, which needs indentation relative to
+          # its header line and would break under this same sed.
+          python3 <(cat << 'PYEOF' | sed 's/^[[:space:]]*//'
+          import coremltools as ct
+          import numpy as np
+          m = ct.models.CompiledMLModel("SwipeAnnotator.mlmodelc")
+          print("Loaded OK via CompiledMLModel.")
+          img = 128
+          inputs = {
+          "fast_frame": np.zeros((1, 2, img, img), dtype=np.float32),
+          "slow_frame": np.zeros((1, 2, img, img), dtype=np.float32),
+          "has_slow":   np.zeros((1,), dtype=np.float32),
+          "h_fast_in":  np.zeros((2, 1, 192), dtype=np.float32),
+          "h_slow_in":  np.zeros((1, 1, 96), dtype=np.float32),
+          }
+          out = m.predict(inputs)
+          [print(f"  {k}: shape={np.array(v).shape}") for k, v in out.items()]
+          print("Dummy forward pass succeeded.")
+          PYEOF
+          )
+
       - name: Build tweak
         run: |
           set -euo pipefail
+          which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
+          which ldid || echo "WARNING: ldid not on PATH — signing will fail"
+          which fakeroot || echo "WARNING: fakeroot shim not on PATH — staging/signing will fail"
           make clean || true
-          make FINALPACKAGE=1 V=1
+
+          # No FAKEROOT= override here — see note in the "Install packaging
+          # tools" step above for why blanking it globally broke staging.
+          # The shim on PATH lets Theos's own $(FAKEROOT) work as intended.
+          make package FINALPACKAGE=1 V=1
 
       - name: Locate build output
         id: find_deb
         run: |
           set -euo pipefail
-          DEB_PATH=$(find packages -name '*.deb' | head -n1)
+          ls -la packages/ 2>/dev/null || echo "packages/ directory does not exist — packaging step did not run or failed silently"
+          DEB_PATH=$(find packages -name '*.deb' 2>/dev/null | head -n1)
           if [ -z "$DEB_PATH" ]; then
-            echo "ERROR: no .deb produced under packages/"; exit 1
+            echo "ERROR: no .deb produced under packages/. Check the 'Build tweak' step log above for dpkg-deb errors."
+            exit 1
           fi
           echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
 
