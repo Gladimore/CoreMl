@@ -84,7 +84,22 @@ class StepWrapper(nn.Module):
         mask = has_slow.view(1, 1, 1)
         h_slow_new = mask * h_slow_candidate + (1.0 - mask) * h_slow
 
-        fused = torch.cat([h_fast_new[-1], h_slow_new[-1]], dim=-1)
+        # NOTE: h_fast_new[-1] (negative-index tensor indexing) traces
+        # through torch.jit.trace as a gather/index_select op, which Core
+        # ML's BNNS Graph backend doesn't support -- coremlcompiler fails
+        # with "Unsupported opset for gather op" and silently produces an
+        # incomplete .mlmodelc (present on disk, but missing Manifest.json
+        # and unloadable). h_fast_new/h_slow_new have a static, known shape
+        # (num_layers, B, hidden) at trace time, so the "last layer" we
+        # actually want is expressible as a plain static slice instead --
+        # .narrow(0, num_layers - 1, 1).squeeze(0) traces to a real slice
+        # op, not a gather, and is numerically identical to [-1].
+        fast_layers = h_fast_new.shape[0]
+        slow_layers = h_slow_new.shape[0]
+        h_fast_last = h_fast_new.narrow(0, fast_layers - 1, 1).squeeze(0)
+        h_slow_last = h_slow_new.narrow(0, slow_layers - 1, 1).squeeze(0)
+
+        fused = torch.cat([h_fast_last, h_slow_last], dim=-1)
         fused = self.model.drop(fused)  # no-op in eval() anyway
 
         det_logits = self.model.det_head(fused).squeeze(-1)
