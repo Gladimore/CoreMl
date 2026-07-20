@@ -102,9 +102,15 @@ jobs:
           # torch pinned to 2.7.0 -- coremltools' own warning during
           # conversion flagged that 2.13.0 (latest at the time this was
           # written) "has not been tested with coremltools", and 2.7.0 as
-          # "the most recent version that has been tested". Keeping this
-          # pin regardless of the note below, since it's still good
-          # practice against coremltools compatibility warnings generally.
+          # "the most recent version that has been tested". That mismatch
+          # is the likely cause of a real failure we hit: `coremlcompiler`
+          # errored out compiling MIL to the BNNS graph backend with
+          # "Unsupported opset for gather op" -- almost certainly because a
+          # too-new torch traced an op shape/pattern (from indexing the
+          # GRU's hidden state, e.g. h_fast_new[-1]) that this coremltools
+          # version's BNNS backend doesn't yet recognize. If you bump this
+          # pin later, re-verify the compiled .mlmodelc actually loads
+          # (see the sanity-check step below) before trusting it.
           #
           # UPDATED ROOT CAUSE NOTE: the "Unsupported opset for gather op"
           # failure this comment used to blame on torch version / on
