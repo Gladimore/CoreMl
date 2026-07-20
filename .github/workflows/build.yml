@@ -102,15 +102,9 @@ jobs:
           # torch pinned to 2.7.0 -- coremltools' own warning during
           # conversion flagged that 2.13.0 (latest at the time this was
           # written) "has not been tested with coremltools", and 2.7.0 as
-          # "the most recent version that has been tested". That mismatch
-          # is the likely cause of a real failure we hit: `coremlcompiler`
-          # errored out compiling MIL to the BNNS graph backend with
-          # "Unsupported opset for gather op" -- almost certainly because a
-          # too-new torch traced an op shape/pattern (from indexing the
-          # GRU's hidden state, e.g. h_fast_new[-1]) that this coremltools
-          # version's BNNS backend doesn't yet recognize. If you bump this
-          # pin later, re-verify the compiled .mlmodelc actually loads
-          # (see the sanity-check step below) before trusting it.
+          # "the most recent version that has been tested". Keeping this
+          # pin regardless of the note below, since it's still good
+          # practice against coremltools compatibility warnings generally.
           #
           # UPDATED ROOT CAUSE NOTE: the "Unsupported opset for gather op"
           # failure this comment used to blame on torch version / on
@@ -144,16 +138,20 @@ jobs:
           set -euo pipefail
           # convert_to_coreml.py now defaults to convert_to="neuralnetwork"
           # (not passed explicitly here, so the script's own default
-          # applies). That format caps minimum_deployment_target at
-          # iOS14-16 in coremltools -- iOS26 (the old value here) is
-          # incompatible with neuralnetwork and the script will now exit 1
-          # rather than silently doing the wrong thing. iOS15 matches the
-          # tweak's own Makefile (TARGET = iphone:clang:latest:15.0), so
-          # that's what we pass.
+          # applies). coremltools enforces minimum_deployment_target <=
+          # iOS14 for that format -- iOS15+ forces mlprogram and raises a
+          # ValueError, no exceptions (verified directly against
+          # coremltools' _determine_target). iOS26 (the old value here) and
+          # even iOS15/16 (an earlier, incorrect version of this comment)
+          # both fail for that reason. iOS14 is the only valid choice for
+          # neuralnetwork; it's one rung below the tweak's own Makefile
+          # TARGET (iphone:clang:latest:15.0), which is fine -- the Core ML
+          # deployment target only sets the model's own minimum OS, it
+          # doesn't need to match the Theos build target.
           python convert_to_coreml.py \
             --checkpoint checkpoints/best.pt \
             --out SwipeAnnotator.mlpackage \
-            --min_ios iOS15 \
+            --min_ios iOS14 \
             --img_size 128
 
           # `xcrun coremlcompiler compile` can print "Error(s) occurred

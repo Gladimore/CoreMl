@@ -35,6 +35,16 @@ type instead, sidestepping BNNS Graph and the gather op entirely. See
 --convert_to if you want to try mlprogram again later (e.g. once you can
 test against a newer BNNS Graph on real hardware).
 
+IMPORTANT: coremltools requires minimum_deployment_target <= iOS14 for the
+neuralnetwork format -- iOS15 and above forces mlprogram unconditionally
+(raises ValueError otherwise; this isn't a soft default, it's enforced in
+coremltools' own _determine_target logic). So this script's --min_ios
+defaults to iOS14 when --convert_to=neuralnetwork. That's one rung below
+the tweak's own Makefile TARGET (iphone:clang:latest:15.0) -- that's fine:
+the Core ML deployment target only sets the *minimum* OS the .mlmodelc
+will run on, it doesn't need to match the Theos build target, and a lower
+Core ML target only widens device compatibility, never narrows it.
+
 Output: an .mlpackage with 5 inputs / 4 outputs (see IO_SPEC below), ready to
 be compiled to .mlmodelc (see the printed instructions at the end) and loaded
 via the MLModel API from Swift/ObjC. Core ML does not itself produce a
@@ -162,19 +172,23 @@ def main():
     ap.add_argument('--min_ios', default=None,
                      choices=['iOS14', 'iOS15', 'iOS16', 'iOS17', 'iOS18', 'iOS26'],
                      help='minimum_deployment_target. Default depends on --convert_to: '
-                          'iOS15 for neuralnetwork (matches the tweak\'s own iOS 15.0 Makefile '
-                          'TARGET; neuralnetwork does not support iOS17+ targets in coremltools), '
-                          'iOS26 for mlprogram. Only raise/lower this if you know what you need.')
+                          'iOS14 for neuralnetwork (coremltools requires <= iOS14 for that '
+                          'format -- iOS15+ forces mlprogram, no exceptions; this is one rung '
+                          'below the tweak\'s own iOS 15.0 Makefile TARGET, which is fine, a '
+                          'lower deployment target only widens device compatibility), iOS26 '
+                          'for mlprogram. Only raise/lower this if you know what you need.')
     args = ap.parse_args()
 
     if args.min_ios is None:
-        args.min_ios = 'iOS15' if args.convert_to == 'neuralnetwork' else 'iOS26'
+        args.min_ios = 'iOS14' if args.convert_to == 'neuralnetwork' else 'iOS26'
 
-    if args.convert_to == 'neuralnetwork' and args.min_ios not in ('iOS14', 'iOS15', 'iOS16'):
+    if args.convert_to == 'neuralnetwork' and args.min_ios != 'iOS14':
         print(f"[error] --convert_to neuralnetwork is incompatible with "
-              f"--min_ios {args.min_ios} (coremltools targets the neuralnetwork format at "
-              f"iOS14-16-era deployment targets only). Use --min_ios iOS15/iOS16, or drop "
-              f"--min_ios entirely to get the default, or switch to --convert_to mlprogram.",
+              f"--min_ios {args.min_ios}. coremltools requires minimum_deployment_target "
+              f"<= iOS14 for the neuralnetwork format -- iOS15 and above forces mlprogram "
+              f"and raises a ValueError, no exceptions (confirmed against coremltools' own "
+              f"_determine_target logic). Use --min_ios iOS14, drop --min_ios entirely to "
+              f"get the default, or switch to --convert_to mlprogram if you need iOS15+.",
               file=sys.stderr)
         sys.exit(1)
 
