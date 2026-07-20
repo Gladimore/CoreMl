@@ -293,6 +293,7 @@ typedef uint32_t IOOptionBits;   // real def is `typedef UInt32 IOOptionBits` in
 typedef struct __IOHIDEvent *IOHIDEventRef;
 typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
 
+extern "C" {
 extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
 extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
 extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
@@ -300,6 +301,7 @@ extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
     uint32_t eventMask, IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
     IOHIDFloat tipPressure, IOHIDFloat twist, Boolean range, Boolean touch, IOOptionBits options);
 extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+}
 
 static const uint32_t kIOHIDDigitizerEventRange    = 1 << 0;
 static const uint32_t kIOHIDDigitizerEventTouch    = 1 << 1;
