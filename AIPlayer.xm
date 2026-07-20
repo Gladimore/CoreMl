@@ -35,6 +35,7 @@
 #import <objc/runtime.h>
 #include <math.h>
 #include <mach/mach_time.h>
+#include <mach-o/dyld.h>
 
 // ── Model config — MUST match your checkpoint's arch dict + dataset meta ───
 static const NSInteger kImgSize     = 128;   // meta['img_size'] — CONFIRM against your dataset
@@ -388,6 +389,56 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // MARK: - Overlay: single start/stop button
 // =============================================================================
 
+// =============================================================================
+// MARK: - Resource bundle lookup
+//
+// Theos's `AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc` (see the
+// Makefile) stages the compiled model into a SEPARATE bundle at
+// "<jb root>/Library/Application Support/AIPlayer.bundle/" (Theos's default
+// _RESOURCE_DIRS destination — see theos/makefiles/instance/tweak.mk +
+// shared/bundle.mk), not alongside AIPlayer.dylib itself, which normally
+// lives under ".../Library/MobileSubstrate/DynamicLibraries/".
+//
+// [NSBundle bundleForClass:] returns the bundle containing the CODE, not
+// that separate resource bundle — that mismatch, not a broken model, was
+// the direct cause of "SwipeAnnotator.mlmodelc not found in bundle".
+//
+// This resolves the resource bundle's real path by asking dyld where
+// AIPlayer.dylib itself was actually loaded from, then substituting the
+// known suffix. That keeps this working across both rootful (/Library/...)
+// and rootless (e.g. /var/jb/Library/...) jailbreak layouts without
+// hardcoding either prefix — whatever prefix the loader used to find this
+// dylib is read directly from dyld, not guessed.
+// =============================================================================
+
+static NSString *AIPlayerDylibDirectory(void) {
+    uint32_t count = _dyld_image_count();
+    for (uint32_t i = 0; i < count; i++) {
+        const char *name = _dyld_get_image_name(i);
+        if (!name) continue;
+        NSString *path = [NSString stringWithUTF8String:name];
+        if ([path.lastPathComponent isEqualToString:@"AIPlayer.dylib"])
+            return path.stringByDeletingLastPathComponent;
+    }
+    return nil;
+}
+
+static NSBundle *AIPlayerResourceBundle(void) {
+    NSString *dylibDir = AIPlayerDylibDirectory();
+    if (!dylibDir) {
+        NSLog(@"[AIPlayer] Could not locate AIPlayer.dylib's own path via dyld");
+        return nil;
+    }
+    NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
+    NSString *jbRoot = [dylibDir hasSuffix:suffix]
+        ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
+        : dylibDir.stringByDeletingLastPathComponent;  // best-effort fallback if the layout differs
+    NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
+    NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+    if (!bundle) NSLog(@"[AIPlayer] No resource bundle found at expected path: %@", bundlePath);
+    return bundle;
+}
+
 @interface AIOverlayVC : UIViewController
 @property (nonatomic, strong) UIButton *toggleButton;
 @property (nonatomic, assign) BOOL isPlaying;
@@ -424,7 +475,7 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
     [self.toggleButton addGestureRecognizer:drag];
 
     // Load the compiled model from this tweak's own resource bundle.
-    NSBundle *tweakBundle = [NSBundle bundleForClass:[InferenceEngine class]];
+    NSBundle *tweakBundle = AIPlayerResourceBundle();
     NSURL *modelURL = [tweakBundle URLForResource:@"SwipeAnnotator" withExtension:@"mlmodelc"];
     if (modelURL) {
         NSError *err = nil;
