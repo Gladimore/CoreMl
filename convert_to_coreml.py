@@ -85,19 +85,27 @@ class StepWrapper(nn.Module):
         h_slow_new = mask * h_slow_candidate + (1.0 - mask) * h_slow
 
         # NOTE: h_fast_new[-1] (negative-index tensor indexing) traces
-        # through torch.jit.trace as a gather/index_select op, which Core
-        # ML's BNNS Graph backend doesn't support -- coremlcompiler fails
-        # with "Unsupported opset for gather op" and silently produces an
-        # incomplete .mlmodelc (present on disk, but missing Manifest.json
-        # and unloadable). h_fast_new/h_slow_new have a static, known shape
-        # (num_layers, B, hidden) at trace time, so the "last layer" we
-        # actually want is expressible as a plain static slice instead --
-        # .narrow(0, num_layers - 1, 1).squeeze(0) traces to a real slice
-        # op, not a gather, and is numerically identical to [-1].
-        fast_layers = h_fast_new.shape[0]
-        slow_layers = h_slow_new.shape[0]
-        h_fast_last = h_fast_new.narrow(0, fast_layers - 1, 1).squeeze(0)
-        h_slow_last = h_slow_new.narrow(0, slow_layers - 1, 1).squeeze(0)
+        # through torch.jit.trace as an advanced-indexing/gather-style op,
+        # which Core ML's BNNS Graph backend doesn't support --
+        # coremlcompiler fails with "Unsupported opset for gather op" and
+        # silently produces an incomplete .mlmodelc (present on disk, but
+        # missing Manifest.json and unloadable).
+        #
+        # .narrow() was tried as a fix and made things worse -- it hit an
+        # unrelated bug inside coremltools' own slice_by_index type
+        # inference (ValueError building the begin/end constant array).
+        # The actual fix doesn't need narrow() at all: fast_layers/
+        # slow_layers are static Python ints from the model's own config
+        # (not derived from a tensor's .shape at trace time), so a plain
+        # POSITIVE Python-int index -- h_fast_new[fast_layers - 1] --
+        # traces via aten::select (a basic, universally-supported single-
+        # index op), not the gather path that only negative/computed-tensor
+        # indices hit. No .narrow()/.squeeze() needed; positive indexing
+        # already drops the indexed dimension.
+        fast_layers = self.model.fast_layers
+        slow_layers = self.model.slow_layers
+        h_fast_last = h_fast_new[fast_layers - 1]
+        h_slow_last = h_slow_new[slow_layers - 1]
 
         fused = torch.cat([h_fast_last, h_slow_last], dim=-1)
         fused = self.model.drop(fused)  # no-op in eval() anyway
