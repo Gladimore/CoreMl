@@ -123,11 +123,21 @@ jobs:
           echo "Model compiled:"
           du -sh SwipeAnnotator.mlmodelc
 
-          # Load-back sanity check: confirms the .mlmodelc is actually a
-          # valid, loadable model (not just a directory that happens to
-          # exist) by running one dummy forward pass through it. A
-          # structurally-broken graph fails here, in CI, instead of showing
-          # up as "model not loaded" / a hollow prediction on-device.
+          # Load-back sanity check: confirms the *source* SwipeAnnotator.mlmodel
+          # is valid and produces sane output shapes, via one dummy forward pass.
+          #
+          # Deliberately loads SwipeAnnotator.mlmodel here, NOT the compiled
+          # SwipeAnnotator.mlmodelc from the step above. ct.models.MLModel()
+          # loads a path via coremltools' package/manifest logic, which expects
+          # either a plain .mlmodel file or an ML-Program .mlpackage bundle --
+          # an already-AOT-compiled .mlmodelc (this script's "neuralnetwork"/
+          # Espresso format) never contains a Manifest.json, so pointing
+          # MLModel() at it always raises "A valid manifest does not exist",
+          # even when the .mlmodelc is completely fine. That's a Python-loader
+          # limitation, not evidence of a broken compile -- the .mlmodelc is
+          # exactly what ships in the tweak bundle and is what device runtime
+          # (AIPlayer.xm) loads directly via the MLModel API, which does not
+          # have this restriction.
           #
           # Shapes below mirror --img_size 128 above and AIPlayer.xm's
           # kHidden/kFastLayers/kSlowLayers constants (192/2/1, so
@@ -138,7 +148,7 @@ jobs:
           import coremltools as ct
           import numpy as np
 
-          m = ct.models.MLModel("SwipeAnnotator.mlmodelc")
+          m = ct.models.MLModel("SwipeAnnotator.mlmodel")
           spec = m.get_spec()
           print(f"Loaded OK. {len(spec.description.input)} inputs, {len(spec.description.output)} outputs.")
 
