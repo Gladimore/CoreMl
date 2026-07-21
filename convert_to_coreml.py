@@ -55,6 +55,42 @@ while_loop/gather/scatter can appear. Verified bit-exact (max abs diff
 identical weights/inputs -- see the assertion in build_and_trace() below,
 which re-checks this against your actual checkpoint every time you run this
 script, not just a one-off synthetic test.
+
+CURRENT STATE (convert_to="neuralnetwork" instead of "mlprogram")
+---------------------------------------------------------------------------
+manual_gru_step() DID eliminate the gather/while_loop/scatter ops and the
+"Unsupported opset for gather op" BNNS Graph error -- confirmed via the raw
+MIL text of a converted model, and confirmed by its absence from the next
+CI run's log. But that next run still failed: `coremlcompiler` exited 0
+with zero error output, produced a SwipeAnnotator.mlmodelc with real bytes
+in it, yet never wrote a valid Manifest.json -- a different, silent
+failure, with no visibility into why (a tool crashing/getting killed
+mid-write without printing anything is consistent with this, but that's a
+guess, not a diagnosis; this couldn't be reproduced or debugged without a
+Mac).
+
+Rather than keep guessing at what ML Program's newer, more complex AOT
+compilation pipeline is silently choking on, this switches to
+convert_to="neuralnetwork" -- CoreML's older, much simpler spec format,
+which predates ML Program/BNNS Graph entirely and doesn't route through
+that AOT pipeline at all. Every op this model actually uses (Conv2d,
+BatchNorm2d, ReLU, MaxPool2d, AdaptiveAvgPool2d, Linear, elementwise
+add/mul/sub, cat, sigmoid, tanh) has been supported by that format since
+CoreML 1.0 -- it's a much lower-risk thing to try than continuing to poke
+at ML Program's newer pipeline blind. Runtime code (AIPlayer.xm's
+MLModel/CoreML.framework usage) needs zero changes either way; MLModel
+loads and runs both spec formats identically. No ANE-specific tuning is
+lost that this model was actually using (compute_units=ALL still lets
+Core ML pick CPU/GPU/ANE per-op; the neuralnetwork format has always
+supported ANE dispatch too, just via an older, separately-compiled path
+than BNNS Graph).
+
+If this ALSO fails, the next step (per team decision, not something to
+silently fall back to) is dropping Core ML for this model entirely and
+exporting to ONNX Runtime instead, which sidesteps Apple's AOT compiler
+altogether -- at the cost of losing ANE acceleration and requiring a
+rewrite of AIPlayer.xm's InferenceEngine to call ONNX Runtime's C/C++ API
+instead of MLModel.
 """
 
 import argparse
@@ -277,7 +313,27 @@ def main():
     print("[4/5] Converting with coremltools")
     import coremltools as ct
 
-    target = getattr(ct.target, args.min_ios)
+    convert_to = "neuralnetwork"  # see module docstring: trying this before ONNX Runtime
+    if convert_to == "neuralnetwork":
+        # coremltools hard-errors if minimum_deployment_target is iOS15+
+        # and convert_to="neuralnetwork" ("must be 'mlprogram'") -- the
+        # classic spec format simply isn't expressible for iOS15+ targets.
+        # This does NOT restrict which device the model can run on: a
+        # deployment target is a backward-compatibility floor (the oldest
+        # OS the model promises to work on), not an exact-version pin, so
+        # an iOS14-targeted model still loads and runs fine on the actual
+        # iOS 26.5.2 device -- it just avoids relying on any CoreML feature
+        # introduced after iOS14, which this model (Conv2d/BatchNorm2d/
+        # ReLU/MaxPool2d/AdaptiveAvgPool2d/Linear/elementwise ops/sigmoid/
+        # tanh -- all supported since CoreML 1.0) never needed anyway.
+        # --min_ios is ignored here on purpose; it only governs the
+        # mlprogram path.
+        target = ct.target.iOS14
+        if args.min_ios != 'iOS26':  # iOS26 is the argparse default; only warn if the user set something else
+            print(f"[info] --min_ios {args.min_ios} ignored for convert_to='neuralnetwork' "
+                  f"(using iOS14, the highest target that format supports)")
+    else:
+        target = getattr(ct.target, args.min_ios)
     mlmodel = ct.convert(
         traced,
         inputs=[
@@ -294,23 +350,34 @@ def main():
             ct.TensorType(name="h_slow_out"),
         ],
         minimum_deployment_target=target,
-        convert_to="mlprogram",
+        convert_to=convert_to,
         compute_units=ct.ComputeUnit.ALL,  # let Core ML pick ANE/GPU/CPU per-op
     )
 
     # Belt-and-suspenders: fail here, with a clear message, rather than
     # discovering a gather/while_loop op survived some future refactor only
     # when coremlcompiler chokes on it three steps downstream in CI.
-    mil_text = str(mlmodel._mil_program)
-    banned_ops = [op for op in ("gather(", "while_loop(", "scatter(") if op in mil_text]
-    if banned_ops:
-        print(f"[error] Exported MIL graph still contains {banned_ops} -- "
-              f"these are exactly the ops that break BNNS Graph compilation. "
-              f"Something in this file changed to call an RNN op directly "
-              f"again instead of going through manual_gru_step().",
-              file=sys.stderr)
-        sys.exit(1)
-    print("[info] Confirmed: no gather/while_loop/scatter ops in the exported graph")
+    #
+    # Only meaningful for convert_to="mlprogram" -- BNNS Graph (the backend
+    # that couldn't compile gather/while_loop/scatter) is an ML Program
+    # concept. The classic "neuralnetwork" spec format doesn't go through
+    # BNNS Graph AOT compilation at all, and mlmodel._mil_program isn't
+    # guaranteed to exist the same way for that format, so this check is
+    # skipped rather than potentially crashing on an unrelated attribute.
+    if convert_to == "mlprogram":
+        mil_text = str(mlmodel._mil_program)
+        banned_ops = [op for op in ("gather(", "while_loop(", "scatter(") if op in mil_text]
+        if banned_ops:
+            print(f"[error] Exported MIL graph still contains {banned_ops} -- "
+                  f"these are exactly the ops that break BNNS Graph compilation. "
+                  f"Something in this file changed to call an RNN op directly "
+                  f"again instead of going through manual_gru_step().",
+                  file=sys.stderr)
+            sys.exit(1)
+        print("[info] Confirmed: no gather/while_loop/scatter ops in the exported graph")
+    else:
+        print(f"[info] convert_to={convert_to!r} -- gather/while_loop/scatter check "
+              f"skipped (that check only applies to the mlprogram/BNNS Graph path)")
 
     mlmodel.short_description = "CausalSwipeAnnotator — streaming step() inference"
     mlmodel.input_description["fast_frame"] = "Current frame (frame, diff), normalized 0-255 uint8 range"
