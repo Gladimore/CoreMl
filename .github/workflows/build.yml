@@ -36,33 +36,15 @@ jobs:
           which ldid
           ldid -h > /dev/null 2>&1 || { echo "ERROR: ldid installed but not runnable (check dyld arch errors above)"; exit 1; }
 
-          # NOTE: deliberately not brew-installing fakeroot. Homebrew's
-          # native arm64 build ships an arm64e-only libfakeroot.dylib, which
-          # crashes dyld on GitHub's Apple Silicon runners ("incompatible
-          # architecture (have 'arm64', need 'arm64e')").
-          #
-          # Theos's $(FAKEROOT) is NOT just "the fakeroot binary" -- it's
-          # $THEOS/bin/fakeroot.sh plus a -p <persistence-file> argument
-          # (see common.mk), and it's invoked throughout staging/signing,
-          # not only in deb.mk's packaging line. Blanking FAKEROOT= at the
-          # top-level `make` invocation makes ALL of those call sites see
-          # an empty value -- including a bare `$(FAKEROOT) -c` used during
-          # staging to close out the persistence file, which then becomes
-          # the literal token `-c` executed as a command, producing
-          # "bash: -c: command not found" / Error 127 inside `before-stage`,
-          # before the build ever reaches packaging.
-          #
-          # Fix: give Theos a working `fakeroot` on PATH instead of
-          # removing FAKEROOT globally. This ephemeral CI container has no
-          # real multi-user ownership to fake, so a shim that strips
-          # fakeroot's own flags/persistence args and execs the wrapped
-          # command directly is sufficient, and it keeps every internal
-          # $(FAKEROOT) call site -- staging, signing, and the final
-          # dpkg-deb packaging line -- working uniformly.
+          # Not brew-installing fakeroot: Homebrew's native arm64 build ships
+          # an arm64e-only libfakeroot.dylib, which crashes dyld on GitHub's
+          # Apple Silicon runners ("incompatible architecture (have 'arm64',
+          # need 'arm64e')"). Theos's $(FAKEROOT) is invoked throughout
+          # staging/signing (not just deb.mk's packaging line), so this
+          # ephemeral CI container -- which has no real multi-user ownership
+          # to fake -- gets a shim on PATH instead: it strips fakeroot's own
+          # flags/persistence args and execs the wrapped command directly.
           mkdir -p "$HOME/.local/bin"
-          # Piped through sed to strip the leading whitespace that YAML's
-          # block-scalar indentation would otherwise bake into the heredoc
-          # body (which would break the shebang line).
           cat << 'EOF' | sed 's/^[[:space:]]*//' > "$HOME/.local/bin/fakeroot"
           #!/bin/sh
           while [ "$#" -gt 0 ]; do
@@ -99,29 +81,21 @@ jobs:
       - name: Install Core ML conversion dependencies
         run: |
           set -euo pipefail
-          # torch pinned to 2.7.0 per coremltools' own compatibility
-          # warning (2.13.0 "has not been tested", 2.7.0 is "the most
-          # recent version that has been tested"). Kept as a defensive
-          # pin even though it turned out NOT to be the cause of the
-          # "Unsupported opset for gather op" BNNS Graph compile failure
-          # this workflow used to hit -- that was traced (see
-          # convert_to_coreml.py's module docstring) to coremltools'
-          # generic GRU->MIL lowering always emitting a while_loop with
-          # gather/scatter, regardless of torch version or how this
-          # script indexes the hidden state. convert_to_coreml.py now
-          # avoids that lowering entirely (manual_gru_step()), and
-          # self-checks that no gather/while_loop/scatter op survives
-          # in the exported graph before it will even write the
-          # .mlpackage. If you bump this pin later, re-verify the
-          # compiled .mlmodelc actually loads (see the sanity-check
-          # step below) before trusting it.
+          # torch pinned per coremltools' own compatibility notes.
           pip install torch==2.7.0 coremltools
 
       # ── Checkpoint -> Core ML ────────────────────────────────────────────
       # Produces SwipeAnnotator.mlmodelc in the repo root. The Makefile's
-      # GrayHueCapture_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies
-      # it into the tweak's resource bundle during `make`. This step MUST
-      # run before Build.
+      # AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies it into
+      # the tweak's resource bundle during `make`. This step MUST run
+      # before Build.
+      #
+      # convert_to_coreml.py emits the "neuralnetwork" Core ML spec format,
+      # whose container is a single .mlmodel file -- NOT .mlpackage (that's
+      # the ML Program format's container, and mixing the two produces a
+      # .mlmodelc with no valid compiled model inside it, which then fails
+      # opaquely at load time). See convert_to_coreml.py's module docstring
+      # for why "neuralnetwork" is used here.
       #
       # --checkpoint points at checkpoints/best.pt, committed to this repo.
       # If your checkpoint lives somewhere else (Kaggle, cloud storage),
@@ -132,21 +106,13 @@ jobs:
           set -euo pipefail
           python convert_to_coreml.py \
             --checkpoint checkpoints/best.pt \
-            --out SwipeAnnotator.mlpackage \
-            --min_ios iOS26 \
+            --out SwipeAnnotator.mlmodel \
             --img_size 128
 
-          # `xcrun coremlcompiler compile` can print "Error(s) occurred
-          # compiling MIL to BNNS graph" and still exit 0, still producing a
-          # SwipeAnnotator.mlmodelc directory -- BNNS graph is an optional
-          # fast execution path, and coremlcompiler doesn't always treat a
-          # failure to build it as fatal to the overall compile. That let a
-          # broken model sail straight through the old `test -d` check
-          # below, get packaged, and fail silently on-device instead of
-          # here. Capture the compiler's output explicitly and treat any
-          # "error" text as fatal regardless of exit code, since the exit
-          # code alone isn't trustworthy for this failure mode.
-          xcrun coremlcompiler compile SwipeAnnotator.mlpackage . 2>&1 | tee /tmp/coremlcompiler.log
+          # `xcrun coremlcompiler compile` can print errors and still exit 0,
+          # so treat any "error" text in its output as fatal regardless of
+          # exit code.
+          xcrun coremlcompiler compile SwipeAnnotator.mlmodel . 2>&1 | tee /tmp/coremlcompiler.log
           compiler_status=${PIPESTATUS[0]}
           if [ "$compiler_status" -ne 0 ] || grep -qi "error" /tmp/coremlcompiler.log; then
             echo "ERROR: coremlcompiler reported a failure (or nonzero exit) -- see log above."
@@ -163,11 +129,11 @@ jobs:
           # structurally-broken graph fails here, in CI, instead of showing
           # up as "model not loaded" / a hollow prediction on-device.
           #
-          # Shapes below mirror the fixed --img_size 128 above and
-          # AIPlayer.xm's kHidden/kFastLayers/kSlowLayers constants
-          # (192/2/1, so slow_hidden = 192/2 = 96). If you change the
-          # architecture or img_size, update both this block and the
-          # matching constants in AIPlayer.xm together.
+          # Shapes below mirror --img_size 128 above and AIPlayer.xm's
+          # kHidden/kFastLayers/kSlowLayers constants (192/2/1, so
+          # slow_hidden = 192/2 = 96). If you change the architecture or
+          # img_size, update both this block and the matching constants in
+          # AIPlayer.xm together.
           python3 - << 'PYEOF'
           import coremltools as ct
           import numpy as np
@@ -197,10 +163,6 @@ jobs:
           which ldid || echo "WARNING: ldid not on PATH — signing will fail"
           which fakeroot || echo "WARNING: fakeroot shim not on PATH — staging/signing will fail"
           make clean || true
-
-          # No FAKEROOT= override here — see note in the "Install packaging
-          # tools" step above for why blanking it globally broke staging.
-          # The shim on PATH lets Theos's own $(FAKEROOT) work as intended.
           make package FINALPACKAGE=1 V=1
 
       - name: Locate build output

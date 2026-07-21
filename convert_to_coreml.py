@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 convert_to_coreml.py — Convert a CausalSwipeAnnotator checkpoint (.pt) into a
-Core ML .mlpackage for streaming, single-frame-per-tick inference.
+Core ML model for streaming, single-frame-per-tick inference.
 
-Run this on your Mac (coremltools' mlprogram/ANE toolchain requires macOS to
-be fully useful, and you'll want Xcode's coremlcompiler for the next step
-anyway). Requires: torch, coremltools.
+Run this on your Mac (coremltools' toolchain requires macOS to be fully
+useful, and you'll want Xcode's coremlcompiler for the next step anyway).
+Requires: torch, coremltools.
 
     pip install torch==2.7.0 coremltools
 
 Usage:
     python convert_to_coreml.py \
         --checkpoint runs/causal_v1/best.pt \
-        --out SwipeAnnotator.mlpackage \
+        --out SwipeAnnotator.mlmodel \
         --img_size 128
 
 `--img_size` must match what the model was trained on. The script tries to
@@ -20,77 +20,60 @@ recover it automatically from checkpoint['args']['img_size'] (train_causal.py
 saves the full argparse Namespace there); pass it explicitly if that lookup
 fails, e.g. because you trained with an older checkpoint format.
 
-Output: an .mlpackage with 5 inputs / 4 outputs (see IO_SPEC below), ready to
-be compiled to .mlmodelc (see the printed instructions at the end) and loaded
-via the MLModel API from Swift/ObjC. Core ML does not itself produce a
-.dylib — that's a step you take afterwards if you need a C/C++-callable
-wrapper (see the "Getting to a .dylib" note printed at the end).
+Output format: this script emits the classic "neuralnetwork" Core ML spec
+(a single .mlmodel file), NOT an ML Program .mlpackage. The two are not
+interchangeable — see "WHY neuralnetwork, NOT mlprogram" below. Make sure
+--out ends in .mlmodel; downstream tooling (coremlcompiler, this repo's CI)
+assumes that extension matches the format actually being written.
 
 WHY THIS FILE DOESN'T JUST CALL self.model.fast_gru()/slow_gru() DIRECTLY
 ---------------------------------------------------------------------------
-Calling nn.GRU's own forward() -- even with a real sequence length of 1,
-which is all step()-based streaming ever uses -- makes coremltools' PyTorch
-frontend lower it to a MIL `while_loop` containing `gather`/`scatter` ops
-(this is how coremltools translates GRU/LSTM in general: as an explicit
-step-through-the-sequence loop, regardless of whether the traced sequence
-length happens to be 1). Core ML's BNNS Graph backend doesn't support that
-opset, so `xcrun coremlcompiler compile` fails with "Unsupported opset for
-gather op" -- and does so *silently*: it still exits 0 and still produces a
-SwipeAnnotator.mlmodelc directory, just one that's missing Manifest.json and
-can't actually be loaded. (Confirmed by inspecting the raw MIL text of a
-converted model: the gather/scatter/while_loop trio lives entirely inside
-coremltools' GRU lowering, not anywhere in this file's own code -- two
-earlier attempts to fix this by changing how the *final* hidden state was
-indexed [`h_fast_new[-1]` -> `.narrow()` -> `h_fast_new[fast_layers - 1]`]
-had zero effect on the error for exactly this reason: neither one was ever
-the actual source.)
+coremltools' PyTorch frontend lowers nn.GRU (even with a real sequence
+length of 1, which is all step()-based streaming ever uses) to a MIL
+`while_loop` containing `gather`/`scatter` ops. Core ML's BNNS Graph
+backend doesn't support that opset, so `xcrun coremlcompiler compile` fails
+with "Unsupported opset for gather op" -- silently: it still exits 0 and
+still produces a .mlmodelc directory, just one that's missing a valid
+compiled model and can't actually be loaded.
 
-The fix used below: `manual_gru_step()` reimplements the standard GRU update
-equations by hand, using nn.GRU's own trained weight/bias tensors, called
-once per layer inside a plain Python for-loop. torch.jit.trace fully unrolls
-a Python loop over a small static range into straight-line ops -- there is
-no sequence dimension left to loop over at the MIL level at all, so no
-while_loop/gather/scatter can appear. Verified bit-exact (max abs diff
-~2e-7, i.e. float32 rounding noise) against nn.GRU's own forward() on
-identical weights/inputs -- see the assertion in build_and_trace() below,
-which re-checks this against your actual checkpoint every time you run this
-script, not just a one-off synthetic test.
+The fix: `manual_gru_step()` reimplements the standard GRU update equations
+by hand, using nn.GRU's own trained weight/bias tensors, called once per
+layer inside a plain Python for-loop. torch.jit.trace fully unrolls a
+Python loop over a small static range into straight-line ops, so no
+while_loop/gather/scatter survives at the MIL level. Verified bit-exact
+(max abs diff ~2e-7, float32 rounding noise) against nn.GRU's own forward()
+on identical weights/inputs every time this script runs (see
+assert_manual_gru_matches below) -- not just a one-off dev-time test.
 
-CURRENT STATE (convert_to="neuralnetwork" instead of "mlprogram")
+WHY neuralnetwork, NOT mlprogram
 ---------------------------------------------------------------------------
-manual_gru_step() DID eliminate the gather/while_loop/scatter ops and the
-"Unsupported opset for gather op" BNNS Graph error -- confirmed via the raw
-MIL text of a converted model, and confirmed by its absence from the next
-CI run's log. But that next run still failed: `coremlcompiler` exited 0
-with zero error output, produced a SwipeAnnotator.mlmodelc with real bytes
-in it, yet never wrote a valid Manifest.json -- a different, silent
-failure, with no visibility into why (a tool crashing/getting killed
-mid-write without printing anything is consistent with this, but that's a
-guess, not a diagnosis; this couldn't be reproduced or debugged without a
-Mac).
+manual_gru_step() eliminates the gather/while_loop/scatter ops that break
+BNNS Graph compilation under convert_to="mlprogram". But mlprogram's newer
+AOT compilation pipeline was independently observed to silently fail in a
+different way: coremlcompiler exiting 0 with a real-looking .mlmodelc that
+nonetheless has no valid compiled model inside it, with no diagnostic
+output explaining why.
 
-Rather than keep guessing at what ML Program's newer, more complex AOT
-compilation pipeline is silently choking on, this switches to
-convert_to="neuralnetwork" -- CoreML's older, much simpler spec format,
-which predates ML Program/BNNS Graph entirely and doesn't route through
-that AOT pipeline at all. Every op this model actually uses (Conv2d,
-BatchNorm2d, ReLU, MaxPool2d, AdaptiveAvgPool2d, Linear, elementwise
-add/mul/sub, cat, sigmoid, tanh) has been supported by that format since
-CoreML 1.0 -- it's a much lower-risk thing to try than continuing to poke
-at ML Program's newer pipeline blind. Runtime code (AIPlayer.xm's
-MLModel/CoreML.framework usage) needs zero changes either way; MLModel
-loads and runs both spec formats identically. No ANE-specific tuning is
-lost that this model was actually using (compute_units=ALL still lets
-Core ML pick CPU/GPU/ANE per-op; the neuralnetwork format has always
-supported ANE dispatch too, just via an older, separately-compiled path
-than BNNS Graph).
+convert_to="neuralnetwork" sidesteps that pipeline entirely -- it's Core
+ML's older, simpler spec format, predating ML Program/BNNS Graph, and every
+op this model uses (Conv2d, BatchNorm2d, ReLU, MaxPool2d,
+AdaptiveAvgPool2d, Linear, elementwise ops, cat, sigmoid, tanh) has been
+supported since CoreML 1.0. No runtime code changes are needed either way;
+MLModel loads and runs both spec formats identically, and the
+"neuralnetwork" format still supports ANE dispatch (via an older,
+separately-compiled path than BNNS Graph).
 
-If this ALSO fails, the next step (per team decision, not something to
-silently fall back to) is dropping Core ML for this model entirely and
-exporting to ONNX Runtime instead, which sidesteps Apple's AOT compiler
-altogether -- at the cost of losing ANE acceleration and requiring a
-rewrite of AIPlayer.xm's InferenceEngine to call ONNX Runtime's C/C++ API
-instead of MLModel.
+The tradeoff: "neuralnetwork" only supports deployment targets up to
+iOS14, since minimum_deployment_target >= iOS15 requires "mlprogram". This
+is a backward-compatibility floor, not a ceiling -- an iOS14-targeted model
+still loads and runs fine on current devices; it just can't use any Core ML
+feature introduced after iOS14, none of which this model needs.
+
+If this ever needs revisiting: the next step (per team decision, not a
+silent fallback) would be dropping Core ML for this model in favor of ONNX
+Runtime, which sidesteps Apple's AOT compiler entirely -- at the cost of
+losing ANE acceleration and rewriting AIPlayer.xm's InferenceEngine to call
+ONNX Runtime's C/C++ API instead of MLModel.
 """
 
 import argparse
@@ -123,13 +106,12 @@ Every subsequent call: feed back h_fast_out / h_slow_out from the previous call.
 
 def manual_gru_step(x: torch.Tensor, h: torch.Tensor, gru: nn.GRU) -> torch.Tensor:
     """
-    Single-step, multi-layer GRU forward using `gru`'s own trained weights --
-    with no internal sequence loop, since step()-based streaming inference
-    only ever processes one timestep at a time. See the module docstring
-    for why this exists instead of just calling gru(x, h).
+    Single-step, multi-layer GRU forward using `gru`'s own trained weights,
+    with no internal sequence loop (step()-based streaming inference only
+    ever processes one timestep at a time). See module docstring for why
+    this exists instead of just calling gru(x, h).
 
-    Implements PyTorch's own documented GRU equations (matches nn.GRU
-    exactly -- this is not an approximation):
+    Implements PyTorch's own documented GRU equations exactly:
         r = sigmoid(W_ir x + b_ir + W_hr h + b_hr)
         z = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
         n = tanh(W_in x + b_in + r * (W_hn h + b_hn))
@@ -169,11 +151,10 @@ def manual_gru_step(x: torch.Tensor, h: torch.Tensor, gru: nn.GRU) -> torch.Tens
 def assert_manual_gru_matches(model: CausalSwipeAnnotator, atol: float = 1e-5):
     """
     Re-verifies manual_gru_step() against nn.GRU's own forward() using THIS
-    checkpoint's actual trained weights, every time this script runs -- not
-    just a one-off synthetic test during development. Cheap (a handful of
-    random-input forward passes) and it's the one check standing between
-    "the export is mathematically faithful" and "silently wrong
-    predictions on-device", so it isn't optional.
+    checkpoint's actual trained weights, every time this script runs. Cheap
+    (a handful of random-input forward passes) and it's the one check
+    standing between "the export is mathematically faithful" and "silently
+    wrong predictions on-device", so it isn't optional.
     """
     torch.manual_seed(0)
     for gru, num_layers, hidden in (
@@ -188,9 +169,8 @@ def assert_manual_gru_matches(model: CausalSwipeAnnotator, atol: float = 1e-5):
         max_diff = (h_ref - h_manual).abs().max().item()
         if not torch.allclose(h_ref, h_manual, atol=atol):
             print(f"[error] manual_gru_step diverges from nn.GRU by {max_diff} "
-                  f"(tolerance {atol}) -- DO NOT trust the exported model. "
-                  f"This should only fail if manual_gru_step's math or gate "
-                  f"ordering has been changed incorrectly.", file=sys.stderr)
+                  f"(tolerance {atol}) -- DO NOT trust the exported model.",
+                  file=sys.stderr)
             sys.exit(1)
         print(f"[info] manual_gru_step verified against nn.GRU (max diff {max_diff:.2e})")
 
@@ -204,16 +184,14 @@ class StepWrapper(nn.Module):
     original step()'s `if slow_frame is not None` would silently become a
     permanent constant (always-has-slow or always-no-slow) baked into the
     traced graph, depending on which one you traced with. We avoid that by
-    using a `has_slow` tensor to blend between "new slow state" and "carried
-    slow state" arithmetically, so the exported model has ONE fixed graph
-    that behaves correctly at runtime for either case, selected each call by
-    an input tensor rather than by which Python branch got traced.
+    using a `has_slow` tensor to blend between "new slow state" and
+    "carried slow state" arithmetically, so the exported model has ONE
+    fixed graph that behaves correctly at runtime for either case, selected
+    each call by an input tensor rather than by which Python branch got
+    traced.
 
     GRU steps go through manual_gru_step() rather than calling
-    self.model.fast_gru()/slow_gru() directly -- see the module docstring
-    for why (coremltools' generic GRU->MIL lowering emits a while_loop with
-    gather/scatter that Core ML's BNNS Graph backend can't compile, even
-    though our traced sequence length is always exactly 1).
+    self.model.fast_gru()/slow_gru() directly -- see the module docstring.
     """
 
     def __init__(self, model: CausalSwipeAnnotator):
@@ -231,8 +209,7 @@ class StepWrapper(nn.Module):
         h_slow_new = mask * h_slow_candidate + (1.0 - mask) * h_slow
 
         # Plain positive-int indexing on a statically-known dim -- traces to
-        # aten::select, not a gather. (Not the source of the original bug,
-        # but no reason to use a negative index either.)
+        # aten::select, not a gather.
         fast_layers = self.model.fast_layers
         slow_layers = self.model.slow_layers
         h_fast_last = h_fast_new[fast_layers - 1]
@@ -265,14 +242,18 @@ def recover_img_size(checkpoint: dict, cli_value: int) -> int:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--checkpoint', required=True, help='Path to .pt checkpoint (e.g. best.pt)')
-    ap.add_argument('--out', default='SwipeAnnotator.mlpackage', help='Output .mlpackage path')
+    ap.add_argument('--out', default='SwipeAnnotator.mlmodel',
+                     help='Output path. Must end in .mlmodel -- this script always emits '
+                          'the "neuralnetwork" spec format, not an .mlpackage.')
     ap.add_argument('--img_size', type=int, default=None,
                      help='Frame H=W. Auto-recovered from checkpoint args if omitted.')
-    ap.add_argument('--min_ios', default='iOS26',
-                     choices=['iOS16', 'iOS17', 'iOS18', 'iOS26'],
-                     help='minimum_deployment_target. Default iOS26 (matches a 26.5.2 device); '
-                          'lower this only if you also need older-device support.')
     args = ap.parse_args()
+
+    if not args.out.endswith('.mlmodel'):
+        print(f"[error] --out '{args.out}' must end in .mlmodel "
+              f"(this script emits convert_to='neuralnetwork', whose container is a "
+              f"single .mlmodel file, not an .mlpackage)", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[1/5] Loading checkpoint: {args.checkpoint}")
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
@@ -310,30 +291,9 @@ def main():
     with torch.no_grad():
         traced = torch.jit.trace(wrapper, example, check_trace=True)
 
-    print("[4/5] Converting with coremltools")
+    print("[4/5] Converting with coremltools (convert_to='neuralnetwork')")
     import coremltools as ct
 
-    convert_to = "neuralnetwork"  # see module docstring: trying this before ONNX Runtime
-    if convert_to == "neuralnetwork":
-        # coremltools hard-errors if minimum_deployment_target is iOS15+
-        # and convert_to="neuralnetwork" ("must be 'mlprogram'") -- the
-        # classic spec format simply isn't expressible for iOS15+ targets.
-        # This does NOT restrict which device the model can run on: a
-        # deployment target is a backward-compatibility floor (the oldest
-        # OS the model promises to work on), not an exact-version pin, so
-        # an iOS14-targeted model still loads and runs fine on the actual
-        # iOS 26.5.2 device -- it just avoids relying on any CoreML feature
-        # introduced after iOS14, which this model (Conv2d/BatchNorm2d/
-        # ReLU/MaxPool2d/AdaptiveAvgPool2d/Linear/elementwise ops/sigmoid/
-        # tanh -- all supported since CoreML 1.0) never needed anyway.
-        # --min_ios is ignored here on purpose; it only governs the
-        # mlprogram path.
-        target = ct.target.iOS14
-        if args.min_ios != 'iOS26':  # iOS26 is the argparse default; only warn if the user set something else
-            print(f"[info] --min_ios {args.min_ios} ignored for convert_to='neuralnetwork' "
-                  f"(using iOS14, the highest target that format supports)")
-    else:
-        target = getattr(ct.target, args.min_ios)
     mlmodel = ct.convert(
         traced,
         inputs=[
@@ -349,35 +309,13 @@ def main():
             ct.TensorType(name="h_fast_out"),
             ct.TensorType(name="h_slow_out"),
         ],
-        minimum_deployment_target=target,
-        convert_to=convert_to,
+        # "neuralnetwork" only supports targets up to iOS14 (mlprogram is
+        # required for iOS15+) -- see "WHY neuralnetwork, NOT mlprogram"
+        # in the module docstring.
+        minimum_deployment_target=ct.target.iOS14,
+        convert_to="neuralnetwork",
         compute_units=ct.ComputeUnit.ALL,  # let Core ML pick ANE/GPU/CPU per-op
     )
-
-    # Belt-and-suspenders: fail here, with a clear message, rather than
-    # discovering a gather/while_loop op survived some future refactor only
-    # when coremlcompiler chokes on it three steps downstream in CI.
-    #
-    # Only meaningful for convert_to="mlprogram" -- BNNS Graph (the backend
-    # that couldn't compile gather/while_loop/scatter) is an ML Program
-    # concept. The classic "neuralnetwork" spec format doesn't go through
-    # BNNS Graph AOT compilation at all, and mlmodel._mil_program isn't
-    # guaranteed to exist the same way for that format, so this check is
-    # skipped rather than potentially crashing on an unrelated attribute.
-    if convert_to == "mlprogram":
-        mil_text = str(mlmodel._mil_program)
-        banned_ops = [op for op in ("gather(", "while_loop(", "scatter(") if op in mil_text]
-        if banned_ops:
-            print(f"[error] Exported MIL graph still contains {banned_ops} -- "
-                  f"these are exactly the ops that break BNNS Graph compilation. "
-                  f"Something in this file changed to call an RNN op directly "
-                  f"again instead of going through manual_gru_step().",
-                  file=sys.stderr)
-            sys.exit(1)
-        print("[info] Confirmed: no gather/while_loop/scatter ops in the exported graph")
-    else:
-        print(f"[info] convert_to={convert_to!r} -- gather/while_loop/scatter check "
-              f"skipped (that check only applies to the mlprogram/BNNS Graph path)")
 
     mlmodel.short_description = "CausalSwipeAnnotator — streaming step() inference"
     mlmodel.input_description["fast_frame"] = "Current frame (frame, diff), normalized 0-255 uint8 range"
