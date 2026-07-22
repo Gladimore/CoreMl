@@ -217,9 +217,18 @@ jobs:
           # every path dpkg actually put in the package -- if the model
           # isn't in that list, AIPlayer.xm has nothing to load on-device
           # no matter how its runtime lookup logic searches for it.
+          #
+          # Captured to a variable rather than piped into `grep -q`:
+          # dpkg-deb -c streams through an internal tar subprocess, and
+          # `grep -q` exits the instant it finds a match without draining
+          # the rest of stdin. That earns tar a SIGPIPE/broken-pipe write
+          # error, which -- under `pipefail` -- fails this whole step even
+          # when the grep match (i.e. the actual thing being checked)
+          # succeeded. Capturing first sidesteps the race entirely.
+          PKG_CONTENTS="$(dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}")"
           echo "Package contents:"
-          dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}"
-          if ! dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}" | grep -q "SwipeAnnotator.mlmodelc/"; then
+          echo "$PKG_CONTENTS"
+          if ! echo "$PKG_CONTENTS" | grep -q "SwipeAnnotator.mlmodelc/"; then
             echo "ERROR: SwipeAnnotator.mlmodelc is NOT present in the built .deb."
             echo "This means the model was never staged during 'make package' --"
             echo "check the Makefile's resource-staging variable (must be"
