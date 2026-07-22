@@ -413,30 +413,66 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 
 static NSString *AIPlayerDylibDirectory(void) {
     uint32_t count = _dyld_image_count();
+    NSString *lastResortMatch = nil;
     for (uint32_t i = 0; i < count; i++) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         NSString *path = [NSString stringWithUTF8String:name];
+        // Primary match: exact filename.
         if ([path.lastPathComponent isEqualToString:@"AIPlayer.dylib"])
             return path.stringByDeletingLastPathComponent;
+        // Fallback: some jailbreak loaders (ElleKit, TrollStore-style
+        // substrate replacements, symlinked DynamicLibraries dirs) report a
+        // dyld image path that doesn't match the exact on-disk filename
+        // case-for-case, or resolves through a symlink first. Case-insensitive
+        // containment catches those without falsely matching an unrelated image.
+        if ([path.lastPathComponent.lowercaseString containsString:@"aiplayer"] &&
+            [path.pathExtension.lowercaseString isEqualToString:@"dylib"]) {
+            lastResortMatch = path.stringByDeletingLastPathComponent;
+        }
+    }
+    if (lastResortMatch) {
+        NSLog(@"[AIPlayer] Matched AIPlayer.dylib via fallback (case/symlink mismatch on exact match)");
+        return lastResortMatch;
     }
     return nil;
 }
 
+// Candidate jailbreak roots to try, in order, when we can't derive one from
+// dyld's reported path (or when the derived one doesn't contain a resource
+// bundle). Covers rootful, rootless (var/jb), and common rootless variants.
+static NSArray<NSString *> *AIPlayerCandidateJBRoots(NSString *derivedRoot) {
+    NSMutableArray<NSString *> *roots = [NSMutableArray array];
+    if (derivedRoot) [roots addObject:derivedRoot];
+    for (NSString *r in @[@"/var/jb", @"/", @"/var/jb/var/jb"]) {
+        if (![roots containsObject:r]) [roots addObject:r];
+    }
+    return roots;
+}
+
 static NSBundle *AIPlayerResourceBundle(void) {
     NSString *dylibDir = AIPlayerDylibDirectory();
-    if (!dylibDir) {
-        NSLog(@"[AIPlayer] Could not locate AIPlayer.dylib's own path via dyld");
-        return nil;
+    NSString *derivedRoot = nil;
+    if (dylibDir) {
+        NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
+        derivedRoot = [dylibDir hasSuffix:suffix]
+            ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
+            : dylibDir.stringByDeletingLastPathComponent;  // best-effort fallback if the layout differs
+    } else {
+        NSLog(@"[AIPlayer] Could not locate AIPlayer.dylib's own path via dyld -- falling back to known jailbreak roots");
     }
-    NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
-    NSString *jbRoot = [dylibDir hasSuffix:suffix]
-        ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
-        : dylibDir.stringByDeletingLastPathComponent;  // best-effort fallback if the layout differs
-    NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
-    NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
-    if (!bundle) NSLog(@"[AIPlayer] No resource bundle found at expected path: %@", bundlePath);
-    return bundle;
+
+    for (NSString *jbRoot in AIPlayerCandidateJBRoots(derivedRoot)) {
+        NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
+        NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
+        if (bundle) {
+            NSLog(@"[AIPlayer] Resource bundle found at: %{public}@", bundlePath);
+            return bundle;
+        }
+        NSLog(@"[AIPlayer] No resource bundle at: %{public}@", bundlePath);
+    }
+    NSLog(@"[AIPlayer] Exhausted all candidate roots -- resource bundle not found anywhere");
+    return nil;
 }
 
 @interface AIOverlayVC : UIViewController
@@ -485,7 +521,7 @@ static NSBundle *AIPlayerResourceBundle(void) {
             NSLog(@"[AIPlayer] Model loaded from %@", modelURL);
         }
     } else {
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found in bundle %@", tweakBundle.bundlePath);
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found in bundle %{public}@", tweakBundle.bundlePath);
     }
 }
 
