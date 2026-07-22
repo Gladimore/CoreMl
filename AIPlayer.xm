@@ -392,29 +392,25 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // =============================================================================
 // MARK: - Resource bundle lookup
 //
-// Earlier versions of this function tried to predict exactly where Theos's
-// `AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc` staged the file, first
-// guessing a separate "AIPlayer.bundle" (wrong -- that's only created by
-// the BUNDLE_-prefixed variable, which this Makefile doesn't use), then
-// guessing "next to AIPlayer.dylib" (also apparently wrong, per on-device
-// logs -- Theos's actual _RESOURCE_DIRS destination differs by version/
-// scheme in ways not worth re-deriving from documentation a third time).
+// ROOT CAUSE (found and fixed in the Makefile): this tweak's Makefile was
+// setting `AIPlayer_RESOURCE_DIRS`, but Theos's instance/tweak.mk only
+// wires up the BUNDLE_-prefixed variable (`AIPlayer_BUNDLE_RESOURCE_DIRS`)
+// for a `tweak`-type target -- the un-prefixed name is a bundle.mk concept
+// that doesn't apply here. That made the model-staging step a silent
+// no-op: `make` succeeded, no warning, but SwipeAnnotator.mlmodelc was
+// simply never copied into the .deb. No amount of runtime path-searching
+// could have found it, because it was never on the device at all.
 //
-// Simpler and more robust: actually search the filesystem for it at
-// startup, the same way you'd `find / -iname SwipeAnnotator.mlmodelc` over
-// SSH. This tweak already runs with full filesystem read access (it's
-// loaded as root/mobile inside a jailbroken injection context, same
-// access level needed for the IOHIDEvent injection below), so there's no
-// permission barrier to doing this from Objective-C directly -- no SSH
-// round-trip required to find out where Theos really put the file.
+// With the Makefile corrected, the compiled model is staged at the
+// standard, documented location for a tweak's BUNDLE_RESOURCE_DIRS:
+//   <jb root>/Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc
 //
-// Search roots are the union of: this dylib's own directory (fast path --
-// correct if RESOURCE_DIRS stages next to the dylib after all), plus a
-// short list of directories that could plausibly contain ANY jailbreak
-// tweak's staged resources across rootful/rootless layouts. This is NOT a
-// full "/" scan (which would be slow and could hang on virtual/proc-like
-// mounts) -- it's a bounded, shallow-ish walk of known tweak-adjacent
-// trees only.
+// We resolve <jb root> from where dyld actually loaded AIPlayer.dylib
+// (works for both rootful and rootless/var-jb layouts without hardcoding
+// either), then do one direct existence check. A short list of
+// known-layout fallbacks plus a small bounded filesystem scan remain as
+// defensive belt-and-suspenders in case a future Theos/jailbreak layout
+// change moves the goalposts again -- not because we expect to need them.
 // =============================================================================
 
 static NSString *AIPlayerDylibDirectory(void) {
@@ -434,11 +430,20 @@ static NSString *AIPlayerDylibDirectory(void) {
     return lastResortMatch;
 }
 
+// Derives "<jb root>" from AIPlayer.dylib's own loaded path, e.g.
+// ".../var/jb/Library/MobileSubstrate/DynamicLibraries" -> ".../var/jb".
+static NSString *AIPlayerJBRoot(void) {
+    NSString *dylibDir = AIPlayerDylibDirectory();
+    if (!dylibDir) return nil;
+    NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
+    return [dylibDir hasSuffix:suffix]
+        ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
+        : dylibDir.stringByDeletingLastPathComponent;
+}
+
 // Recursively searches `root` for a directory literally named `filename`,
 // depth-limited so a search rooted somewhere unexpectedly large can't hang
-// startup. Returns the first match (NSDirectoryEnumerator is DFS-ordered,
-// not guaranteed alphabetical, but staged tweak resource trees are small
-// and shallow in practice, so "first match" is effectively "the match").
+// startup. Fallback only -- see comment block above.
 static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, NSInteger maxDepth) {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
@@ -448,7 +453,7 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
         enumeratorAtURL:[NSURL fileURLWithPath:root isDirectory:YES]
         includingPropertiesForKeys:@[NSURLIsDirectoryKey]
         options:NSDirectoryEnumerationSkipsHiddenFiles
-        errorHandler:^BOOL(NSURL *url, NSError *error) { return YES; /* skip unreadable entries, keep going */ }];
+        errorHandler:^BOOL(NSURL *url, NSError *error) { return YES; }];
     if (!e) return nil;
 
     NSInteger rootDepth = root.pathComponents.count;
@@ -466,36 +471,49 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
 }
 
 // Returns the URL to the compiled model, or nil with diagnostic logging if
-// it can't be found anywhere searched.
+// it can't be found anywhere.
 static NSURL *AIPlayerModelURL(void) {
-    NSMutableArray<NSString *> *searchRoots = [NSMutableArray array];
+    NSString *jbRoot = AIPlayerJBRoot();
 
-    NSString *dylibDir = AIPlayerDylibDirectory();
-    if (dylibDir) [searchRoots addObject:dylibDir];  // fast path, checked first, shallow
-
-    // Broader roots covering rootful and rootless (/var/jb) tweak-adjacent
-    // trees. Each is searched to a bounded depth -- not an unbounded "/"
-    // walk -- since a tweak's own staged resources are never buried deep.
-    for (NSString *r in @[
-        @"/Library/MobileSubstrate/DynamicLibraries",
-        @"/var/jb/Library/MobileSubstrate/DynamicLibraries",
-        @"/Library/Application Support",
-        @"/var/jb/Library/Application Support",
-        @"/Library",
-        @"/var/jb/Library",
-    ]) {
-        if (![searchRoots containsObject:r]) [searchRoots addObject:r];
+    // Primary, expected path.
+    if (jbRoot) {
+        NSString *primary = [jbRoot stringByAppendingPathComponent:
+            @"Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:primary]) {
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", primary);
+            return [NSURL fileURLWithPath:primary isDirectory:YES];
+        }
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found at expected path: %@", primary);
+    } else {
+        NSLog(@"[AIPlayer] Could not derive jailbreak root from dyld -- trying known fallback roots");
     }
 
-    for (NSString *root in searchRoots) {
-        NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/4);
+    // Known-layout fallbacks (rootful and rootless), in case jbRoot
+    // derivation above didn't work for some reason.
+    for (NSString *root in @[@"/var/jb", @"/"]) {
+        if ([root isEqualToString:jbRoot]) continue;  // already tried above
+        NSString *candidate = [root stringByAppendingPathComponent:
+            @"Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
+            return [NSURL fileURLWithPath:candidate isDirectory:YES];
+        }
+    }
+
+    // Last resort: bounded filesystem scan.
+    for (NSString *root in @[@"/var/jb/Library/Application Support", @"/Library/Application Support"]) {
+        NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/3);
         if (found) {
-            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", found);
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
             return [NSURL fileURLWithPath:found isDirectory:YES];
         }
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found under: %@", root);
     }
-    NSLog(@"[AIPlayer] Exhausted all search roots -- model not found anywhere");
+
+    NSLog(@"[AIPlayer] Exhausted all lookups -- model not found. "
+          @"If this persists, verify SwipeAnnotator.mlmodelc actually made it "
+          @"into the .deb (dpkg -L <package id> on-device) -- if it's not "
+          @"listed there, the packaging step didn't stage it and no runtime "
+          @"lookup will find it.");
     return nil;
 }
 

@@ -187,6 +187,29 @@ jobs:
           fi
           echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
 
+      - name: Verify model was staged into the package
+        run: |
+          set -euo pipefail
+          # Guards against a silent-no-op staging bug: an incorrect Theos
+          # resource variable name (e.g. XXX_RESOURCE_DIRS instead of
+          # XXX_BUNDLE_RESOURCE_DIRS for a tweak-type Makefile target) makes
+          # `make package` succeed with no warning while simply never
+          # copying SwipeAnnotator.mlmodelc into the .deb. dpkg-deb -c lists
+          # every path dpkg actually put in the package -- if the model
+          # isn't in that list, AIPlayer.xm has nothing to load on-device
+          # no matter how its runtime lookup logic searches for it.
+          echo "Package contents:"
+          dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}"
+          if ! dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}" | grep -q "SwipeAnnotator.mlmodelc/"; then
+            echo "ERROR: SwipeAnnotator.mlmodelc is NOT present in the built .deb."
+            echo "This means the model was never staged during 'make package' --"
+            echo "check the Makefile's resource-staging variable (must be"
+            echo "AIPlayer_BUNDLE_RESOURCE_DIRS for a tweak-type target, not"
+            echo "AIPlayer_RESOURCE_DIRS) before debugging anything at runtime."
+            exit 1
+          fi
+          echo "OK: SwipeAnnotator.mlmodelc is present in the package."
+
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
