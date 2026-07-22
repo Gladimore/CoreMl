@@ -392,25 +392,29 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // =============================================================================
 // MARK: - Resource bundle lookup
 //
-// Theos has two distinct resource-staging mechanisms, and this Makefile
-// uses the plain one:
+// Earlier versions of this function tried to predict exactly where Theos's
+// `AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc` staged the file, first
+// guessing a separate "AIPlayer.bundle" (wrong -- that's only created by
+// the BUNDLE_-prefixed variable, which this Makefile doesn't use), then
+// guessing "next to AIPlayer.dylib" (also apparently wrong, per on-device
+// logs -- Theos's actual _RESOURCE_DIRS destination differs by version/
+// scheme in ways not worth re-deriving from documentation a third time).
 //
-//   AIPlayer_RESOURCE_DIRS       (no BUNDLE_ prefix) -- what this Makefile sets.
-//   AIPlayer_BUNDLE_RESOURCE_DIRS (WITH BUNDLE_ prefix) -- a different variable.
+// Simpler and more robust: actually search the filesystem for it at
+// startup, the same way you'd `find / -iname SwipeAnnotator.mlmodelc` over
+// SSH. This tweak already runs with full filesystem read access (it's
+// loaded as root/mobile inside a jailbroken injection context, same
+// access level needed for the IOHIDEvent injection below), so there's no
+// permission barrier to doing this from Objective-C directly -- no SSH
+// round-trip required to find out where Theos really put the file.
 //
-// Per Theos's own tweak.mk, only the BUNDLE_-prefixed variable triggers
-// staging into a separate "<jb root>/Library/Application Support/
-// AIPlayer.bundle/" bundle. Plain _RESOURCE_DIRS (what we use) copies
-// resources directly alongside AIPlayer.dylib itself, in
-// ".../Library/MobileSubstrate/DynamicLibraries/". There is no
-// AIPlayer.bundle on disk at all with this Makefile -- searching for one,
-// under any candidate root, will always fail. That was the actual bug
-// behind "No resource bundle found" / "Exhausted all candidate roots".
-//
-// Fix: look for SwipeAnnotator.mlmodelc in the same directory as
-// AIPlayer.dylib, found via dyld (works unmodified across rootful and
-// rootless/var-jb layouts, since we ask the loader where the dylib
-// actually came from rather than guessing a prefix).
+// Search roots are the union of: this dylib's own directory (fast path --
+// correct if RESOURCE_DIRS stages next to the dylib after all), plus a
+// short list of directories that could plausibly contain ANY jailbreak
+// tweak's staged resources across rootful/rootless layouts. This is NOT a
+// full "/" scan (which would be slow and could hang on virtual/proc-like
+// mounts) -- it's a bounded, shallow-ish walk of known tweak-adjacent
+// trees only.
 // =============================================================================
 
 static NSString *AIPlayerDylibDirectory(void) {
@@ -420,56 +424,78 @@ static NSString *AIPlayerDylibDirectory(void) {
         const char *name = _dyld_get_image_name(i);
         if (!name) continue;
         NSString *path = [NSString stringWithUTF8String:name];
-        // Primary match: exact filename.
         if ([path.lastPathComponent isEqualToString:@"AIPlayer.dylib"])
             return path.stringByDeletingLastPathComponent;
-        // Fallback: some jailbreak loaders (ElleKit, TrollStore-style
-        // substrate replacements, symlinked DynamicLibraries dirs) report a
-        // dyld image path that doesn't match the exact on-disk filename
-        // case-for-case, or resolves through a symlink first. Case-insensitive
-        // containment catches those without falsely matching an unrelated image.
         if ([path.lastPathComponent.lowercaseString containsString:@"aiplayer"] &&
             [path.pathExtension.lowercaseString isEqualToString:@"dylib"]) {
             lastResortMatch = path.stringByDeletingLastPathComponent;
         }
     }
-    if (lastResortMatch) {
-        NSLog(@"[AIPlayer] Matched AIPlayer.dylib via fallback (case/symlink mismatch on exact match)");
-        return lastResortMatch;
+    return lastResortMatch;
+}
+
+// Recursively searches `root` for a directory literally named `filename`,
+// depth-limited so a search rooted somewhere unexpectedly large can't hang
+// startup. Returns the first match (NSDirectoryEnumerator is DFS-ordered,
+// not guaranteed alphabetical, but staged tweak resource trees are small
+// and shallow in practice, so "first match" is effectively "the match").
+static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, NSInteger maxDepth) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    BOOL isDir = NO;
+    if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) return nil;
+
+    NSDirectoryEnumerator<NSURL *> *e = [fm
+        enumeratorAtURL:[NSURL fileURLWithPath:root isDirectory:YES]
+        includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+        options:NSDirectoryEnumerationSkipsHiddenFiles
+        errorHandler:^BOOL(NSURL *url, NSError *error) { return YES; /* skip unreadable entries, keep going */ }];
+    if (!e) return nil;
+
+    NSInteger rootDepth = root.pathComponents.count;
+    for (NSURL *url in e) {
+        NSInteger depth = url.pathComponents.count - rootDepth;
+        if (depth > maxDepth) { [e skipDescendants]; continue; }
+
+        NSNumber *isDirNum = nil;
+        [url getResourceValue:&isDirNum forKey:NSURLIsDirectoryKey error:nil];
+        if ([isDirNum boolValue] && [url.lastPathComponent isEqualToString:filename]) {
+            return url.path;
+        }
     }
     return nil;
 }
 
-// Returns the directory that should contain SwipeAnnotator.mlmodelc: the
-// same directory AIPlayer.dylib was loaded from. Falls back to the
-// well-known DynamicLibraries paths (rootful and rootless) if dyld lookup
-// fails for some reason, so this still works even if AIPlayerDylibDirectory
-// can't find a match.
-static NSArray<NSString *> *AIPlayerCandidateResourceDirs(void) {
-    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
-    NSString *dylibDir = AIPlayerDylibDirectory();
-    if (dylibDir) [dirs addObject:dylibDir];
-    for (NSString *d in @[
-        @"/var/jb/Library/MobileSubstrate/DynamicLibraries",
-        @"/Library/MobileSubstrate/DynamicLibraries",
-    ]) {
-        if (![dirs containsObject:d]) [dirs addObject:d];
-    }
-    return dirs;
-}
-
 // Returns the URL to the compiled model, or nil with diagnostic logging if
-// it can't be found in any candidate location.
+// it can't be found anywhere searched.
 static NSURL *AIPlayerModelURL(void) {
-    for (NSString *dir in AIPlayerCandidateResourceDirs()) {
-        NSString *modelPath = [dir stringByAppendingPathComponent:@"SwipeAnnotator.mlmodelc"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:modelPath]) {
-            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", modelPath);
-            return [NSURL fileURLWithPath:modelPath isDirectory:YES];
-        }
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found at: %@", modelPath);
+    NSMutableArray<NSString *> *searchRoots = [NSMutableArray array];
+
+    NSString *dylibDir = AIPlayerDylibDirectory();
+    if (dylibDir) [searchRoots addObject:dylibDir];  // fast path, checked first, shallow
+
+    // Broader roots covering rootful and rootless (/var/jb) tweak-adjacent
+    // trees. Each is searched to a bounded depth -- not an unbounded "/"
+    // walk -- since a tweak's own staged resources are never buried deep.
+    for (NSString *r in @[
+        @"/Library/MobileSubstrate/DynamicLibraries",
+        @"/var/jb/Library/MobileSubstrate/DynamicLibraries",
+        @"/Library/Application Support",
+        @"/var/jb/Library/Application Support",
+        @"/Library",
+        @"/var/jb/Library",
+    ]) {
+        if (![searchRoots containsObject:r]) [searchRoots addObject:r];
     }
-    NSLog(@"[AIPlayer] Exhausted all candidate directories -- model not found anywhere");
+
+    for (NSString *root in searchRoots) {
+        NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/4);
+        if (found) {
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", found);
+            return [NSURL fileURLWithPath:found isDirectory:YES];
+        }
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found under: %@", root);
+    }
+    NSLog(@"[AIPlayer] Exhausted all search roots -- model not found anywhere");
     return nil;
 }
 
