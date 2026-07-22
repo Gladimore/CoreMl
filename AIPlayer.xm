@@ -392,23 +392,25 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // =============================================================================
 // MARK: - Resource bundle lookup
 //
-// Theos's `AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc` (see the
-// Makefile) stages the compiled model into a SEPARATE bundle at
-// "<jb root>/Library/Application Support/AIPlayer.bundle/" (Theos's default
-// _RESOURCE_DIRS destination — see theos/makefiles/instance/tweak.mk +
-// shared/bundle.mk), not alongside AIPlayer.dylib itself, which normally
-// lives under ".../Library/MobileSubstrate/DynamicLibraries/".
+// Theos has two distinct resource-staging mechanisms, and this Makefile
+// uses the plain one:
 //
-// [NSBundle bundleForClass:] returns the bundle containing the CODE, not
-// that separate resource bundle — that mismatch, not a broken model, was
-// the direct cause of "SwipeAnnotator.mlmodelc not found in bundle".
+//   AIPlayer_RESOURCE_DIRS       (no BUNDLE_ prefix) -- what this Makefile sets.
+//   AIPlayer_BUNDLE_RESOURCE_DIRS (WITH BUNDLE_ prefix) -- a different variable.
 //
-// This resolves the resource bundle's real path by asking dyld where
-// AIPlayer.dylib itself was actually loaded from, then substituting the
-// known suffix. That keeps this working across both rootful (/Library/...)
-// and rootless (e.g. /var/jb/Library/...) jailbreak layouts without
-// hardcoding either prefix — whatever prefix the loader used to find this
-// dylib is read directly from dyld, not guessed.
+// Per Theos's own tweak.mk, only the BUNDLE_-prefixed variable triggers
+// staging into a separate "<jb root>/Library/Application Support/
+// AIPlayer.bundle/" bundle. Plain _RESOURCE_DIRS (what we use) copies
+// resources directly alongside AIPlayer.dylib itself, in
+// ".../Library/MobileSubstrate/DynamicLibraries/". There is no
+// AIPlayer.bundle on disk at all with this Makefile -- searching for one,
+// under any candidate root, will always fail. That was the actual bug
+// behind "No resource bundle found" / "Exhausted all candidate roots".
+//
+// Fix: look for SwipeAnnotator.mlmodelc in the same directory as
+// AIPlayer.dylib, found via dyld (works unmodified across rootful and
+// rootless/var-jb layouts, since we ask the loader where the dylib
+// actually came from rather than guessing a prefix).
 // =============================================================================
 
 static NSString *AIPlayerDylibDirectory(void) {
@@ -438,40 +440,36 @@ static NSString *AIPlayerDylibDirectory(void) {
     return nil;
 }
 
-// Candidate jailbreak roots to try, in order, when we can't derive one from
-// dyld's reported path (or when the derived one doesn't contain a resource
-// bundle). Covers rootful, rootless (var/jb), and common rootless variants.
-static NSArray<NSString *> *AIPlayerCandidateJBRoots(NSString *derivedRoot) {
-    NSMutableArray<NSString *> *roots = [NSMutableArray array];
-    if (derivedRoot) [roots addObject:derivedRoot];
-    for (NSString *r in @[@"/var/jb", @"/", @"/var/jb/var/jb"]) {
-        if (![roots containsObject:r]) [roots addObject:r];
+// Returns the directory that should contain SwipeAnnotator.mlmodelc: the
+// same directory AIPlayer.dylib was loaded from. Falls back to the
+// well-known DynamicLibraries paths (rootful and rootless) if dyld lookup
+// fails for some reason, so this still works even if AIPlayerDylibDirectory
+// can't find a match.
+static NSArray<NSString *> *AIPlayerCandidateResourceDirs(void) {
+    NSMutableArray<NSString *> *dirs = [NSMutableArray array];
+    NSString *dylibDir = AIPlayerDylibDirectory();
+    if (dylibDir) [dirs addObject:dylibDir];
+    for (NSString *d in @[
+        @"/var/jb/Library/MobileSubstrate/DynamicLibraries",
+        @"/Library/MobileSubstrate/DynamicLibraries",
+    ]) {
+        if (![dirs containsObject:d]) [dirs addObject:d];
     }
-    return roots;
+    return dirs;
 }
 
-static NSBundle *AIPlayerResourceBundle(void) {
-    NSString *dylibDir = AIPlayerDylibDirectory();
-    NSString *derivedRoot = nil;
-    if (dylibDir) {
-        NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
-        derivedRoot = [dylibDir hasSuffix:suffix]
-            ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
-            : dylibDir.stringByDeletingLastPathComponent;  // best-effort fallback if the layout differs
-    } else {
-        NSLog(@"[AIPlayer] Could not locate AIPlayer.dylib's own path via dyld -- falling back to known jailbreak roots");
-    }
-
-    for (NSString *jbRoot in AIPlayerCandidateJBRoots(derivedRoot)) {
-        NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
-        NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
-        if (bundle) {
-            NSLog(@"[AIPlayer] Resource bundle found at: %@", bundlePath);
-            return bundle;
+// Returns the URL to the compiled model, or nil with diagnostic logging if
+// it can't be found in any candidate location.
+static NSURL *AIPlayerModelURL(void) {
+    for (NSString *dir in AIPlayerCandidateResourceDirs()) {
+        NSString *modelPath = [dir stringByAppendingPathComponent:@"SwipeAnnotator.mlmodelc"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:modelPath]) {
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", modelPath);
+            return [NSURL fileURLWithPath:modelPath isDirectory:YES];
         }
-        NSLog(@"[AIPlayer] No resource bundle at: %@", bundlePath);
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found at: %@", modelPath);
     }
-    NSLog(@"[AIPlayer] Exhausted all candidate roots -- resource bundle not found anywhere");
+    NSLog(@"[AIPlayer] Exhausted all candidate directories -- model not found anywhere");
     return nil;
 }
 
@@ -510,9 +508,9 @@ static NSBundle *AIPlayerResourceBundle(void) {
         initWithTarget:self action:@selector(handleDrag:)];
     [self.toggleButton addGestureRecognizer:drag];
 
-    // Load the compiled model from this tweak's own resource bundle.
-    NSBundle *tweakBundle = AIPlayerResourceBundle();
-    NSURL *modelURL = [tweakBundle URLForResource:@"SwipeAnnotator" withExtension:@"mlmodelc"];
+    // Load the compiled model, staged by Theos alongside AIPlayer.dylib
+    // itself (see the MARK: Resource bundle lookup comment above for why).
+    NSURL *modelURL = AIPlayerModelURL();
     if (modelURL) {
         NSError *err = nil;
         if (![[InferenceEngine sharedEngine] loadModelAtURL:modelURL error:&err]) {
@@ -521,7 +519,7 @@ static NSBundle *AIPlayerResourceBundle(void) {
             NSLog(@"[AIPlayer] Model loaded from %@", modelURL);
         }
     } else {
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found in bundle %@", tweakBundle.bundlePath);
+        NSLog(@"[AIPlayer] Model not loaded -- SwipeAnnotator.mlmodelc was not found (see preceding log lines for paths checked)");
     }
 }
 
