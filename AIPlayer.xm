@@ -466,10 +466,10 @@ static NSBundle *AIPlayerResourceBundle(void) {
         NSString *bundlePath = [jbRoot stringByAppendingPathComponent:@"Library/Application Support/AIPlayer.bundle"];
         NSBundle *bundle = [NSBundle bundleWithPath:bundlePath];
         if (bundle) {
-            NSLog(@"[AIPlayer] Resource bundle found at: %{public}@", bundlePath);
+            NSLog(@"[AIPlayer] Resource bundle found at: %@", bundlePath);
             return bundle;
         }
-        NSLog(@"[AIPlayer] No resource bundle at: %{public}@", bundlePath);
+        NSLog(@"[AIPlayer] No resource bundle at: %@", bundlePath);
     }
     NSLog(@"[AIPlayer] Exhausted all candidate roots -- resource bundle not found anywhere");
     return nil;
@@ -521,7 +521,7 @@ static NSBundle *AIPlayerResourceBundle(void) {
             NSLog(@"[AIPlayer] Model loaded from %@", modelURL);
         }
     } else {
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found in bundle %{public}@", tweakBundle.bundlePath);
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found in bundle %@", tweakBundle.bundlePath);
     }
 }
 
