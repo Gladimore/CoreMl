@@ -123,6 +123,25 @@ jobs:
           echo "Model compiled:"
           du -sh SwipeAnnotator.mlmodelc
 
+          # XXX_BUNDLE_RESOURCE_DIRS (what the Makefile uses to stage this)
+          # copies a directory's CONTENTS into the bundle, flattening it --
+          # it does not preserve the directory itself. Since
+          # SwipeAnnotator.mlmodelc must survive as an actual directory
+          # (Core ML's MLModel loader expects to open a folder by that
+          # name, not find its contents loose), stage it inside a wrapper
+          # directory. Flattening the WRAPPER's contents into the bundle
+          # then correctly leaves SwipeAnnotator.mlmodelc intact as a
+          # subdirectory one level down:
+          #   mlmodel_bundle/SwipeAnnotator.mlmodelc/...  --(flatten mlmodel_bundle)-->
+          #   AIPlayer.bundle/SwipeAnnotator.mlmodelc/...
+          # The Makefile points AIPlayer_BUNDLE_RESOURCE_DIRS at
+          # mlmodel_bundle, not at SwipeAnnotator.mlmodelc directly.
+          rm -rf mlmodel_bundle
+          mkdir mlmodel_bundle
+          mv SwipeAnnotator.mlmodelc mlmodel_bundle/
+          echo "Staged for packaging:"
+          find mlmodel_bundle -maxdepth 2
+
           # Load-back sanity check: confirms the *source* SwipeAnnotator.mlmodel
           # is valid and produces sane output shapes, via one dummy forward pass.
           #

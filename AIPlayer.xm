@@ -392,18 +392,23 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // =============================================================================
 // MARK: - Resource bundle lookup
 //
-// ROOT CAUSE (found and fixed in the Makefile): this tweak's Makefile was
-// setting `AIPlayer_RESOURCE_DIRS`, but Theos's instance/tweak.mk only
+// ROOT CAUSE #1 (found and fixed in the Makefile): this tweak's Makefile
+// was setting `AIPlayer_RESOURCE_DIRS`, but Theos's instance/tweak.mk only
 // wires up the BUNDLE_-prefixed variable (`AIPlayer_BUNDLE_RESOURCE_DIRS`)
 // for a `tweak`-type target -- the un-prefixed name is a bundle.mk concept
 // that doesn't apply here. That made the model-staging step a silent
 // no-op: `make` succeeded, no warning, but SwipeAnnotator.mlmodelc was
-// simply never copied into the .deb. No amount of runtime path-searching
-// could have found it, because it was never on the device at all.
+// simply never copied into the .deb.
 //
-// With the Makefile corrected, the compiled model is staged at the
-// standard, documented location for a tweak's BUNDLE_RESOURCE_DIRS:
-//   <jb root>/Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc
+// ROOT CAUSE #2 (found via `dpkg-deb -c` on the actual built package):
+// Theos's _LOCAL_BUNDLE_INSTALL_PATH defaults to
+// "/Library/Application Support/$(THEOS_CURRENT_INSTANCE)" -- i.e. an
+// extra "AIPlayer/" directory sits between "Application Support" and
+// "AIPlayer.bundle". The real on-disk path, confirmed directly from the
+// package listing, is:
+//   <jb root>/Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc
+// (NOT ".../Application Support/AIPlayer.bundle/..." -- that was this
+// file's own earlier assumption, and it was wrong.)
 //
 // We resolve <jb root> from where dyld actually loaded AIPlayer.dylib
 // (works for both rootful and rootless/var-jb layouts without hardcoding
@@ -478,7 +483,7 @@ static NSURL *AIPlayerModelURL(void) {
     // Primary, expected path.
     if (jbRoot) {
         NSString *primary = [jbRoot stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:primary]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", primary);
             return [NSURL fileURLWithPath:primary isDirectory:YES];
@@ -493,7 +498,7 @@ static NSURL *AIPlayerModelURL(void) {
     for (NSString *root in @[@"/var/jb", @"/"]) {
         if ([root isEqualToString:jbRoot]) continue;  // already tried above
         NSString *candidate = [root stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
             return [NSURL fileURLWithPath:candidate isDirectory:YES];
