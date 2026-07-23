@@ -476,58 +476,41 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
 // logged separately below so you can tell candidates apart even when the
 // full path is redacted in a captured log.
 static NSURL *AIPlayerModelURL(void) {
-    NSString *dylibDir  = AIPlayerDylibDirectory();
-    NSString *bundleDir = [NSBundle mainBundle].bundlePath;
-    NSLog(@"[AIPlayer] Derived dylib directory = %@", dylibDir ?: @"(nil)");
-    NSLog(@"[AIPlayer] Main bundle directory = %@", bundleDir ?: @"(nil)");
+    NSString *jbRoot = AIPlayerJBRoot();
 
-    static NSString *const kModelName = @"SwipeAnnotator.mlmodelc";
-
-    // Candidate layouts, most to least likely for a Sideloadly
-    // dylib+bundle injection (which typically drops both into
-    // "<App>.app/Frameworks/" side by side):
-    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
-    if (dylibDir) {
-        // 1. Model bundle sitting directly next to the dylib.
-        [candidates addObject:[dylibDir stringByAppendingPathComponent:kModelName]];
-        // 2. Model bundle nested inside an AIPlayer.bundle next to the dylib
-        //    (in case Sideloadly preserves the bundle's own directory name
-        //    as a wrapper rather than flattening its contents).
-        [candidates addObject:[[dylibDir stringByAppendingPathComponent:@"AIPlayer.bundle"]
-                                stringByAppendingPathComponent:kModelName]];
-    }
-    if (bundleDir) {
-        // 3. Directly inside the .app root.
-        [candidates addObject:[bundleDir stringByAppendingPathComponent:kModelName]];
-        // 4. Inside the .app's own Frameworks/ dir (covers the case where
-        //    dyld reports a resolved/symlinked path for (1)/(2) that
-        //    doesn't textually match, e.g. via a private/var symlink).
-        [candidates addObject:[[bundleDir stringByAppendingPathComponent:@"Frameworks"]
-                                stringByAppendingPathComponent:kModelName]];
-        [candidates addObject:[[[bundleDir stringByAppendingPathComponent:@"Frameworks"]
-                                 stringByAppendingPathComponent:@"AIPlayer.bundle"]
-                                stringByAppendingPathComponent:kModelName]];
+    // Primary, expected path.
+    if (jbRoot) {
+        NSString *primary = [jbRoot stringByAppendingPathComponent:
+            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+        if ([[NSFileManager defaultManager] fileExistsAtPath:primary]) {
+            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", primary);
+            return [NSURL fileURLWithPath:primary isDirectory:YES];
+        }
+        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found at expected path: %@", primary);
+    } else {
+        NSLog(@"[AIPlayer] Could not derive jailbreak root from dyld -- trying known fallback roots");
     }
 
-    for (NSString *candidate in candidates) {
-        NSLog(@"[AIPlayer] Trying candidate (leaf=%@): %@", candidate.lastPathComponent, candidate);
+    // Known-layout fallbacks (rootful and rootless), in case jbRoot
+    // derivation above didn't work for some reason.
+    for (NSString *root in @[@"/var/jb", @"/"]) {
+        if ([root isEqualToString:jbRoot]) continue;  // already tried above
+        NSString *candidate = [root stringByAppendingPathComponent:
+            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
         if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
             return [NSURL fileURLWithPath:candidate isDirectory:YES];
         }
+        NSLog(@"[AIPlayer] Not found at: %@", candidate);
     }
 
-    // Last resort: bounded scan of the .app bundle itself -- under
-    // Sideloadly injection this is the only place an injected bundle could
-    // plausibly be, so we search here instead of any system/jailbreak path.
-    if (bundleDir) {
-        NSLog(@"[AIPlayer] Scanning under app bundle: %@", bundleDir);
-        NSString *found = AIPlayerFindDirectoryNamed(kModelName, bundleDir, /*maxDepth=*/4);
+    // Last resort: bounded filesystem scan.
+    for (NSString *root in @[@"/var/jb/Library/Application Support", @"/Library/Application Support"]) {
+        NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/3);
         if (found) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
             return [NSURL fileURLWithPath:found isDirectory:YES];
         }
-        NSLog(@"[AIPlayer] Scan under app bundle found nothing");
     }
 
     NSLog(@"[AIPlayer] Exhausted all lookups -- model not found. "
