@@ -29,37 +29,6 @@ jobs:
           restore-keys: |
             theos-${{ runner.os }}-
 
-      - name: Install packaging tools (dpkg, ldid)
-        run: |
-          set -euo pipefail
-          brew install dpkg ldid
-          which ldid
-          ldid -h > /dev/null 2>&1 || { echo "ERROR: ldid installed but not runnable (check dyld arch errors above)"; exit 1; }
-
-          # Not brew-installing fakeroot: Homebrew's native arm64 build ships
-          # an arm64e-only libfakeroot.dylib, which crashes dyld on GitHub's
-          # Apple Silicon runners ("incompatible architecture (have 'arm64',
-          # need 'arm64e')"). Theos's $(FAKEROOT) is invoked throughout
-          # staging/signing (not just deb.mk's packaging line), so this
-          # ephemeral CI container -- which has no real multi-user ownership
-          # to fake -- gets a shim on PATH instead: it strips fakeroot's own
-          # flags/persistence args and execs the wrapped command directly.
-          mkdir -p "$HOME/.local/bin"
-          cat << 'EOF' | sed 's/^[[:space:]]*//' > "$HOME/.local/bin/fakeroot"
-          #!/bin/sh
-          while [ "$#" -gt 0 ]; do
-          case "$1" in
-          --) shift; break ;;
-          -i|-s|-p) shift 2 ;;
-          *) shift ;;
-          esac
-          done
-          exec "$@"
-          EOF
-          chmod +x "$HOME/.local/bin/fakeroot"
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          which fakeroot
-
       - name: Install Theos
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -85,10 +54,9 @@ jobs:
           pip install torch==2.7.0 coremltools
 
       # ── Checkpoint -> Core ML ────────────────────────────────────────────
-      # Produces SwipeAnnotator.mlmodelc in the repo root. The Makefile's
-      # AIPlayer_RESOURCE_DIRS = SwipeAnnotator.mlmodelc then copies it into
-      # the tweak's resource bundle during `make`. This step MUST run
-      # before Build.
+      # Produces SwipeAnnotator.mlmodelc in the repo root. This step MUST
+      # run before the dylib build (the Makefile no longer stages the model
+      # at all -- it ships as its own independent artifact, see below).
       #
       # convert_to_coreml.py emits the "neuralnetwork" Core ML spec format,
       # whose container is a single .mlmodel file -- NOT .mlpackage (that's
@@ -123,25 +91,6 @@ jobs:
           echo "Model compiled:"
           du -sh SwipeAnnotator.mlmodelc
 
-          # XXX_BUNDLE_RESOURCE_DIRS (what the Makefile uses to stage this)
-          # copies a directory's CONTENTS into the bundle, flattening it --
-          # it does not preserve the directory itself. Since
-          # SwipeAnnotator.mlmodelc must survive as an actual directory
-          # (Core ML's MLModel loader expects to open a folder by that
-          # name, not find its contents loose), stage it inside a wrapper
-          # directory. Flattening the WRAPPER's contents into the bundle
-          # then correctly leaves SwipeAnnotator.mlmodelc intact as a
-          # subdirectory one level down:
-          #   mlmodel_bundle/SwipeAnnotator.mlmodelc/...  --(flatten mlmodel_bundle)-->
-          #   AIPlayer.bundle/SwipeAnnotator.mlmodelc/...
-          # The Makefile points AIPlayer_BUNDLE_RESOURCE_DIRS at
-          # mlmodel_bundle, not at SwipeAnnotator.mlmodelc directly.
-          rm -rf mlmodel_bundle
-          mkdir mlmodel_bundle
-          mv SwipeAnnotator.mlmodelc mlmodel_bundle/
-          echo "Staged for packaging:"
-          find mlmodel_bundle -maxdepth 2
-
           # Load-back sanity check: confirms the *source* SwipeAnnotator.mlmodel
           # is valid and produces sane output shapes, via one dummy forward pass.
           #
@@ -154,7 +103,7 @@ jobs:
           # MLModel() at it always raises "A valid manifest does not exist",
           # even when the .mlmodelc is completely fine. That's a Python-loader
           # limitation, not evidence of a broken compile -- the .mlmodelc is
-          # exactly what ships in the tweak bundle and is what device runtime
+          # exactly what ships to Sideloadly and is what device runtime
           # (AIPlayer.xm) loads directly via the MLModel API, which does not
           # have this restriction.
           #
@@ -185,95 +134,51 @@ jobs:
           print("Dummy forward pass succeeded.")
           PYEOF
 
-      - name: Build tweak
+      # ── Build the dylib ──────────────────────────────────────────────────
+      # No dpkg-deb, ldid, or fakeroot needed anymore: this is a plain
+      # `library` target (see Makefile), not a `tweak` target, so there's no
+      # .deb to package and no ad-hoc signing step to fake root ownership
+      # for. `make` alone produces the unsigned arm64 dylib; Sideloadly does
+      # its own signing when it injects and installs.
+      - name: Build dylib
         run: |
           set -euo pipefail
-          which dpkg-deb || echo "WARNING: dpkg-deb not on PATH — packaging will fail"
-          which ldid || echo "WARNING: ldid not on PATH — signing will fail"
-          which fakeroot || echo "WARNING: fakeroot shim not on PATH — staging/signing will fail"
           make clean || true
-          make package FINALPACKAGE=1 V=1
+          make FINALPACKAGE=1 V=1
 
       - name: Locate build output
-        id: find_deb
+        id: find_dylib
         run: |
           set -euo pipefail
-          ls -la packages/ 2>/dev/null || echo "packages/ directory does not exist — packaging step did not run or failed silently"
-          DEB_PATH=$(find packages -name '*.deb' 2>/dev/null | head -n1)
-          if [ -z "$DEB_PATH" ]; then
-            echo "ERROR: no .deb produced under packages/. Check the 'Build tweak' step log above for dpkg-deb errors."
+          DYLIB_PATH=".theos/obj/arm64/AIPlayer.dylib"
+          if [ ! -f "$DYLIB_PATH" ]; then
+            echo "ERROR: $DYLIB_PATH not found. Check the 'Build dylib' step log above."
             exit 1
           fi
-          echo "deb_path=$DEB_PATH" >> "$GITHUB_OUTPUT"
-
-      - name: Verify model was staged into the package
-        run: |
-          set -euo pipefail
-          # Guards against a silent-no-op staging bug: an incorrect Theos
-          # resource variable name (e.g. XXX_RESOURCE_DIRS instead of
-          # XXX_BUNDLE_RESOURCE_DIRS for a tweak-type Makefile target) makes
-          # `make package` succeed with no warning while simply never
-          # copying SwipeAnnotator.mlmodelc into the .deb. dpkg-deb -c lists
-          # every path dpkg actually put in the package -- if the model
-          # isn't in that list, AIPlayer.xm has nothing to load on-device
-          # no matter how its runtime lookup logic searches for it.
-          #
-          # Captured to a variable rather than piped into `grep -q`:
-          # dpkg-deb -c streams through an internal tar subprocess, and
-          # `grep -q` exits the instant it finds a match without draining
-          # the rest of stdin. That earns tar a SIGPIPE/broken-pipe write
-          # error, which -- under `pipefail` -- fails this whole step even
-          # when the grep match (i.e. the actual thing being checked)
-          # succeeded. Capturing first sidesteps the race entirely.
-          PKG_CONTENTS="$(dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}")"
-          echo "Package contents:"
-          echo "$PKG_CONTENTS"
-          if ! echo "$PKG_CONTENTS" | grep -q "SwipeAnnotator.mlmodelc/"; then
-            echo "ERROR: SwipeAnnotator.mlmodelc is NOT present in the built .deb."
-            echo "This means the model was never staged during 'make package' --"
-            echo "check the Makefile's resource-staging variable (must be"
-            echo "AIPlayer_BUNDLE_RESOURCE_DIRS for a tweak-type target, not"
-            echo "AIPlayer_RESOURCE_DIRS) before debugging anything at runtime."
-            exit 1
-          fi
-          echo "OK: SwipeAnnotator.mlmodelc is present in the package."
+          echo "dylib_path=$DYLIB_PATH" >> "$GITHUB_OUTPUT"
 
       - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: AIPlayer-dylib
-          path: .theos/obj/arm64/AIPlayer.dylib
+          path: ${{ steps.find_dylib.outputs.dylib_path }}
           if-no-files-found: error
 
       # ── Sideloadly deployment artifact ───────────────────────────────────
-      # This build's real device target (per AIPlayer.xm's model-lookup
-      # logic) is a non-jailbroken device sideloaded via Sideloadly's
-      # "inject dylib/framework/bundle" option -- NOT a jailbreak install of
-      # the .deb below. Sideloadly injects loose files it's handed directly
-      # into the app bundle; it does not unpack a .deb. So the artifact
-      # Sideloadly actually needs is SwipeAnnotator.mlmodelc itself (as a
-      # zipped folder, since GitHub Actions artifacts are single files/zips)
-      # -- not the .deb, which stages it into a jailbreak-only path
-      # (Library/Application Support/AIPlayer/AIPlayer.bundle/...) that
-      # doesn't exist on a non-jailbroken device.
-      #
-      # Zip, don't tar: this is meant to be unzipped by hand on macOS/
-      # Windows before dragging the resulting SwipeAnnotator.mlmodelc folder
-      # into Sideloadly, and actions/upload-artifact already zips whatever
-      # it's given -- zipping mlmodel_bundle/ ourselves first keeps
+      # Zip, don't tar: this is meant to be unzipped by hand on macOS/Windows
+      # before dragging the resulting SwipeAnnotator.mlmodelc folder into
+      # Sideloadly alongside AIPlayer.dylib. Zipping it ourselves first keeps
       # SwipeAnnotator.mlmodelc's internal directory structure intact as a
-      # single nameable download rather than relying on the double-zip
+      # single nameable download, rather than relying on the double-zip
       # actions/upload-artifact would otherwise produce from a bare folder.
       - name: Package Core ML model for Sideloadly
         run: |
           set -euo pipefail
-          test -d mlmodel_bundle/SwipeAnnotator.mlmodelc || {
-            echo "ERROR: mlmodel_bundle/SwipeAnnotator.mlmodelc missing -- did the 'Convert checkpoint to Core ML' step run?"
+          test -d SwipeAnnotator.mlmodelc || {
+            echo "ERROR: SwipeAnnotator.mlmodelc missing -- did the 'Convert checkpoint to Core ML' step run?"
             exit 1
           }
-          cd mlmodel_bundle
-          zip -r ../SwipeAnnotator.mlmodelc.zip SwipeAnnotator.mlmodelc
-          cd ..
+          zip -r SwipeAnnotator.mlmodelc.zip SwipeAnnotator.mlmodelc
           echo "Zipped for Sideloadly:"
           unzip -l SwipeAnnotator.mlmodelc.zip | head -20
 
@@ -282,11 +187,4 @@ jobs:
         with:
           name: SwipeAnnotator-mlmodelc
           path: SwipeAnnotator.mlmodelc.zip
-          if-no-files-found: error
-
-      - name: Upload deb package
-        uses: actions/upload-artifact@v4
-        with:
-          name: AIPlayer-deb
-          path: ${{ steps.find_deb.outputs.deb_path }}
           if-no-files-found: error
