@@ -479,11 +479,14 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
 // it can't be found anywhere.
 static NSURL *AIPlayerModelURL(void) {
     NSString *jbRoot = AIPlayerJBRoot();
+    NSLog(@"[AIPlayer] Derived jbRoot = %@", jbRoot ?: @"(nil)");
+    NSLog(@"[AIPlayer] Derived dylib directory = %@", AIPlayerDylibDirectory() ?: @"(nil)");
+
+    static NSString *const kSuffix = @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc";
 
     // Primary, expected path.
     if (jbRoot) {
-        NSString *primary = [jbRoot stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+        NSString *primary = [jbRoot stringByAppendingPathComponent:kSuffix];
         if ([[NSFileManager defaultManager] fileExistsAtPath:primary]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", primary);
             return [NSURL fileURLWithPath:primary isDirectory:YES];
@@ -495,23 +498,29 @@ static NSURL *AIPlayerModelURL(void) {
 
     // Known-layout fallbacks (rootful and rootless), in case jbRoot
     // derivation above didn't work for some reason.
-    for (NSString *root in @[@"/var/jb", @"/"]) {
-        if ([root isEqualToString:jbRoot]) continue;  // already tried above
-        NSString *candidate = [root stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+    for (NSString *root in @[@"/var/jb", @""]) {
+        if ([root isEqualToString:jbRoot]) {
+            NSLog(@"[AIPlayer] Skipping fallback root %@ (same as jbRoot, already tried)", root.length ? root : @"/");
+            continue;
+        }
+        NSString *candidate = [root stringByAppendingPathComponent:kSuffix];
+        NSLog(@"[AIPlayer] Trying fallback root %@ -> %@", root.length ? root : @"/", candidate);
         if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
             return [NSURL fileURLWithPath:candidate isDirectory:YES];
         }
+        NSLog(@"[AIPlayer] Not found at: %@", candidate);
     }
 
     // Last resort: bounded filesystem scan.
     for (NSString *root in @[@"/var/jb/Library/Application Support", @"/Library/Application Support"]) {
+        NSLog(@"[AIPlayer] Scanning under: %@", root);
         NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/3);
         if (found) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
             return [NSURL fileURLWithPath:found isDirectory:YES];
         }
+        NSLog(@"[AIPlayer] Scan under %@ found nothing", root);
     }
 
     NSLog(@"[AIPlayer] Exhausted all lookups -- model not found. "
