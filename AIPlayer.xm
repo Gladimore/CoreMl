@@ -392,30 +392,31 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // =============================================================================
 // MARK: - Resource bundle lookup
 //
-// ROOT CAUSE #1 (found and fixed in the Makefile): this tweak's Makefile
-// was setting `AIPlayer_RESOURCE_DIRS`, but Theos's instance/tweak.mk only
-// wires up the BUNDLE_-prefixed variable (`AIPlayer_BUNDLE_RESOURCE_DIRS`)
-// for a `tweak`-type target -- the un-prefixed name is a bundle.mk concept
-// that doesn't apply here. That made the model-staging step a silent
-// no-op: `make` succeeded, no warning, but SwipeAnnotator.mlmodelc was
-// simply never copied into the .deb.
+// DEPLOYMENT MODEL: non-jailbroken, sideloaded via Sideloadly's "inject
+// dylib/framework/bundle" option -- NOT a jailbreak dpkg .deb install.
+// There is no MobileSubstrate, no /var/jb, no root-owned /Library/... tree
+// on this device; none of that exists to look inside. AIPlayer.dylib and
+// SwipeAnnotator.mlmodelc are instead injected straight into the app's own
+// .app bundle (most commonly under "<App>.app/Frameworks/", alongside each
+// other) before Sideloadly re-signs and installs the IPA.
 //
-// ROOT CAUSE #2 (found via `dpkg-deb -c` on the actual built package):
-// Theos's _LOCAL_BUNDLE_INSTALL_PATH defaults to
-// "/Library/Application Support/$(THEOS_CURRENT_INSTANCE)" -- i.e. an
-// extra "AIPlayer/" directory sits between "Application Support" and
-// "AIPlayer.bundle". The real on-disk path, confirmed directly from the
-// package listing, is:
-//   <jb root>/Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc
-// (NOT ".../Application Support/AIPlayer.bundle/..." -- that was this
-// file's own earlier assumption, and it was wrong.)
+// ROOT CAUSE (of the earlier "model not found" failures): this file used
+// to derive a jailbreak-style root from the dylib's load path and look for
+// "<jb root>/Library/Application Support/AIPlayer/AIPlayer.bundle/...".
+// Under Sideloadly injection there is no such root and no such tree --
+// every one of those checks (including the recursive scan of
+// "/Library/Application Support") was guaranteed to fail on this install
+// method, which is exactly what the device logs showed: every fallback
+// exhausted, model never found.
 //
-// We resolve <jb root> from where dyld actually loaded AIPlayer.dylib
-// (works for both rootful and rootless/var-jb layouts without hardcoding
-// either), then do one direct existence check. A short list of
-// known-layout fallbacks plus a small bounded filesystem scan remain as
-// defensive belt-and-suspenders in case a future Theos/jailbreak layout
-// change moves the goalposts again -- not because we expect to need them.
+// Fix: never assume a jailbreak-style root. Resolve everything relative to
+// two anchors that are valid regardless of install method:
+//   (a) the directory AIPlayer.dylib itself physically loaded from (works
+//       under injection, TrollStore, or a real jailbreak alike), and
+//   (b) [NSBundle mainBundle], i.e. the app's own .app directory.
+// Try the realistic candidate layouts under those anchors, then fall back
+// to a small bounded scan of the .app bundle itself (the only place
+// something Sideloadly-injected could plausibly be) before giving up.
 // =============================================================================
 
 static NSString *AIPlayerDylibDirectory(void) {
@@ -433,17 +434,6 @@ static NSString *AIPlayerDylibDirectory(void) {
         }
     }
     return lastResortMatch;
-}
-
-// Derives "<jb root>" from AIPlayer.dylib's own loaded path, e.g.
-// ".../var/jb/Library/MobileSubstrate/DynamicLibraries" -> ".../var/jb".
-static NSString *AIPlayerJBRoot(void) {
-    NSString *dylibDir = AIPlayerDylibDirectory();
-    if (!dylibDir) return nil;
-    NSString *suffix = @"/Library/MobileSubstrate/DynamicLibraries";
-    return [dylibDir hasSuffix:suffix]
-        ? [dylibDir substringToIndex:dylibDir.length - suffix.length]
-        : dylibDir.stringByDeletingLastPathComponent;
 }
 
 // Recursively searches `root` for a directory literally named `filename`,
@@ -477,48 +467,80 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
 
 // Returns the URL to the compiled model, or nil with diagnostic logging if
 // it can't be found anywhere.
+//
+// NOTE ON LOGGING: unlike the old jailbreak-path version, these paths are
+// NOT run through NSLog's %@ private-data redaction concerns in the same
+// way -- app-container paths are still subject to OS log privacy redaction
+// (you'll see <private> in Console.app/log unless you view with --info
+// or --private), but the *last path component* of each candidate is also
+// logged separately below so you can tell candidates apart even when the
+// full path is redacted in a captured log.
 static NSURL *AIPlayerModelURL(void) {
-    NSString *jbRoot = AIPlayerJBRoot();
+    NSString *dylibDir  = AIPlayerDylibDirectory();
+    NSString *bundleDir = [NSBundle mainBundle].bundlePath;
+    NSLog(@"[AIPlayer] Derived dylib directory = %@", dylibDir ?: @"(nil)");
+    NSLog(@"[AIPlayer] Main bundle directory = %@", bundleDir ?: @"(nil)");
 
-    // Primary, expected path.
-    if (jbRoot) {
-        NSString *primary = [jbRoot stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
-        if ([[NSFileManager defaultManager] fileExistsAtPath:primary]) {
-            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", primary);
-            return [NSURL fileURLWithPath:primary isDirectory:YES];
-        }
-        NSLog(@"[AIPlayer] SwipeAnnotator.mlmodelc not found at expected path: %@", primary);
-    } else {
-        NSLog(@"[AIPlayer] Could not derive jailbreak root from dyld -- trying known fallback roots");
+    static NSString *const kModelName = @"SwipeAnnotator.mlmodelc";
+
+    // Candidate layouts, most to least likely for a Sideloadly
+    // dylib+bundle injection (which typically drops both into
+    // "<App>.app/Frameworks/" side by side):
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+    if (dylibDir) {
+        // 1. Model bundle sitting directly next to the dylib.
+        [candidates addObject:[dylibDir stringByAppendingPathComponent:kModelName]];
+        // 2. Model bundle nested inside an AIPlayer.bundle next to the dylib
+        //    (in case Sideloadly preserves the bundle's own directory name
+        //    as a wrapper rather than flattening its contents).
+        [candidates addObject:[[dylibDir stringByAppendingPathComponent:@"AIPlayer.bundle"]
+                                stringByAppendingPathComponent:kModelName]];
+    }
+    if (bundleDir) {
+        // 3. Directly inside the .app root.
+        [candidates addObject:[bundleDir stringByAppendingPathComponent:kModelName]];
+        // 4. Inside the .app's own Frameworks/ dir (covers the case where
+        //    dyld reports a resolved/symlinked path for (1)/(2) that
+        //    doesn't textually match, e.g. via a private/var symlink).
+        [candidates addObject:[[bundleDir stringByAppendingPathComponent:@"Frameworks"]
+                                stringByAppendingPathComponent:kModelName]];
+        [candidates addObject:[[[bundleDir stringByAppendingPathComponent:@"Frameworks"]
+                                 stringByAppendingPathComponent:@"AIPlayer.bundle"]
+                                stringByAppendingPathComponent:kModelName]];
     }
 
-    // Known-layout fallbacks (rootful and rootless), in case jbRoot
-    // derivation above didn't work for some reason.
-    for (NSString *root in @[@"/var/jb", @"/"]) {
-        if ([root isEqualToString:jbRoot]) continue;  // already tried above
-        NSString *candidate = [root stringByAppendingPathComponent:
-            @"Library/Application Support/AIPlayer/AIPlayer.bundle/SwipeAnnotator.mlmodelc"];
+    for (NSString *candidate in candidates) {
+        NSLog(@"[AIPlayer] Trying candidate (leaf=%@): %@", candidate.lastPathComponent, candidate);
         if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
             return [NSURL fileURLWithPath:candidate isDirectory:YES];
         }
     }
 
-    // Last resort: bounded filesystem scan.
-    for (NSString *root in @[@"/var/jb/Library/Application Support", @"/Library/Application Support"]) {
-        NSString *found = AIPlayerFindDirectoryNamed(@"SwipeAnnotator.mlmodelc", root, /*maxDepth=*/3);
+    // Last resort: bounded scan of the .app bundle itself -- under
+    // Sideloadly injection this is the only place an injected bundle could
+    // plausibly be, so we search here instead of any system/jailbreak path.
+    if (bundleDir) {
+        NSLog(@"[AIPlayer] Scanning under app bundle: %@", bundleDir);
+        NSString *found = AIPlayerFindDirectoryNamed(kModelName, bundleDir, /*maxDepth=*/4);
         if (found) {
             NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
             return [NSURL fileURLWithPath:found isDirectory:YES];
         }
+        NSLog(@"[AIPlayer] Scan under app bundle found nothing");
     }
 
     NSLog(@"[AIPlayer] Exhausted all lookups -- model not found. "
-          @"If this persists, verify SwipeAnnotator.mlmodelc actually made it "
-          @"into the .deb (dpkg -L <package id> on-device) -- if it's not "
-          @"listed there, the packaging step didn't stage it and no runtime "
-          @"lookup will find it.");
+          @"This build expects a non-jailbroken, Sideloadly-injected "
+          @"deployment: SwipeAnnotator.mlmodelc must be injected as a "
+          @"bundle/framework alongside AIPlayer.dylib (Sideloadly's "
+          @"'inject dylib/framework/bundle' option), NOT packaged as a "
+          @".deb -- there is no jailbreak root on this device for a .deb "
+          @"install to land in. If this persists, use Sideloadly's log "
+          @"viewer or `log stream --private` on-device to see exactly "
+          @"where AIPlayer.dylib and its bundle were actually placed "
+          @"inside the .app, and compare that against the candidates "
+          @"this function tries.");
     return nil;
 }
 

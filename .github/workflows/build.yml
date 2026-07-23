@@ -217,9 +217,18 @@ jobs:
           # every path dpkg actually put in the package -- if the model
           # isn't in that list, AIPlayer.xm has nothing to load on-device
           # no matter how its runtime lookup logic searches for it.
+          #
+          # Captured to a variable rather than piped into `grep -q`:
+          # dpkg-deb -c streams through an internal tar subprocess, and
+          # `grep -q` exits the instant it finds a match without draining
+          # the rest of stdin. That earns tar a SIGPIPE/broken-pipe write
+          # error, which -- under `pipefail` -- fails this whole step even
+          # when the grep match (i.e. the actual thing being checked)
+          # succeeded. Capturing first sidesteps the race entirely.
+          PKG_CONTENTS="$(dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}")"
           echo "Package contents:"
-          dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}"
-          if ! dpkg-deb -c "${{ steps.find_deb.outputs.deb_path }}" | grep -q "SwipeAnnotator.mlmodelc/"; then
+          echo "$PKG_CONTENTS"
+          if ! echo "$PKG_CONTENTS" | grep -q "SwipeAnnotator.mlmodelc/"; then
             echo "ERROR: SwipeAnnotator.mlmodelc is NOT present in the built .deb."
             echo "This means the model was never staged during 'make package' --"
             echo "check the Makefile's resource-staging variable (must be"
@@ -234,6 +243,45 @@ jobs:
         with:
           name: AIPlayer-dylib
           path: .theos/obj/arm64/AIPlayer.dylib
+          if-no-files-found: error
+
+      # ── Sideloadly deployment artifact ───────────────────────────────────
+      # This build's real device target (per AIPlayer.xm's model-lookup
+      # logic) is a non-jailbroken device sideloaded via Sideloadly's
+      # "inject dylib/framework/bundle" option -- NOT a jailbreak install of
+      # the .deb below. Sideloadly injects loose files it's handed directly
+      # into the app bundle; it does not unpack a .deb. So the artifact
+      # Sideloadly actually needs is SwipeAnnotator.mlmodelc itself (as a
+      # zipped folder, since GitHub Actions artifacts are single files/zips)
+      # -- not the .deb, which stages it into a jailbreak-only path
+      # (Library/Application Support/AIPlayer/AIPlayer.bundle/...) that
+      # doesn't exist on a non-jailbroken device.
+      #
+      # Zip, don't tar: this is meant to be unzipped by hand on macOS/
+      # Windows before dragging the resulting SwipeAnnotator.mlmodelc folder
+      # into Sideloadly, and actions/upload-artifact already zips whatever
+      # it's given -- zipping mlmodel_bundle/ ourselves first keeps
+      # SwipeAnnotator.mlmodelc's internal directory structure intact as a
+      # single nameable download rather than relying on the double-zip
+      # actions/upload-artifact would otherwise produce from a bare folder.
+      - name: Package Core ML model for Sideloadly
+        run: |
+          set -euo pipefail
+          test -d mlmodel_bundle/SwipeAnnotator.mlmodelc || {
+            echo "ERROR: mlmodel_bundle/SwipeAnnotator.mlmodelc missing -- did the 'Convert checkpoint to Core ML' step run?"
+            exit 1
+          }
+          cd mlmodel_bundle
+          zip -r ../SwipeAnnotator.mlmodelc.zip SwipeAnnotator.mlmodelc
+          cd ..
+          echo "Zipped for Sideloadly:"
+          unzip -l SwipeAnnotator.mlmodelc.zip | head -20
+
+      - name: Upload Core ML model (for Sideloadly injection)
+        uses: actions/upload-artifact@v4
+        with:
+          name: SwipeAnnotator-mlmodelc
+          path: SwipeAnnotator.mlmodelc.zip
           if-no-files-found: error
 
       - name: Upload deb package
