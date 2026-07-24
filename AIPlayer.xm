@@ -374,6 +374,41 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 @end
 
 // =============================================================================
+// MARK: - Passthrough window
+//
+// FIX: the previous version put the hitTest: override on a plain UIView
+// (AIPassthroughView) that was merely the root view controller's view
+// *inside* a stock UIWindow. That only affects view-level hit-testing.
+// UIWindow itself is what UIApplication asks first when routing a touch,
+// and a stock UIWindow made visible (hidden = NO) can end up key and
+// swallow the whole event before your view's hitTest: is ever consulted
+// for anything beyond "does this window want the point".
+//
+// AIOverlayWindow overrides hitTest: at the WINDOW level, so a touch
+// outside the button falls through to the window underneath (the game's
+// own key window) exactly the same way the proven-working GrayHueCapture
+// tweak's CaptureOverlayWindow does. It also explicitly refuses to become
+// the key window, so the game's window keeps first-responder/key status
+// at all times — this window only ever exists to host the toggle button.
+// =============================================================================
+
+@interface AIOverlayWindow : UIWindow
+@end
+
+@implementation AIOverlayWindow
+
+- (UIView *)hitTest:(CGPoint)p withEvent:(UIEvent *)e {
+    UIView *hit = [super hitTest:p withEvent:e];
+    return (hit == self) ? nil : hit;
+}
+
+// Never let this overlay window take key status — the game's own window
+// must stay key so its touch/gesture handling keeps working normally.
+- (BOOL)canBecomeKeyWindow { return NO; }
+
+@end
+
+// =============================================================================
 // MARK: - Passthrough view (lets touches fall through to the game)
 // =============================================================================
 
@@ -722,7 +757,12 @@ __attribute__((constructor))
 static void AIPlayerInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         static UIWindow *win = nil;
-        win = [[UIWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
+        // AIOverlayWindow (not stock UIWindow): overrides hitTest: at the
+        // window level and refuses key-window status, so it can never
+        // intercept touches meant for the game. See the MARK: Passthrough
+        // window comment block above for why the previous view-level-only
+        // override wasn't enough.
+        win = [[AIOverlayWindow alloc] initWithFrame:[UIScreen mainScreen].bounds];
         win.windowLevel = UIWindowLevelAlert + 1;
         win.backgroundColor = [UIColor clearColor];
         win.rootViewController = [AIOverlayVC new];
