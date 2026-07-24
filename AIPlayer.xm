@@ -23,6 +23,17 @@
 //   3. diff[t] = clamp( floorDiv((frame[t]-frame[t-1])*127, 255) + 127, 0, 255 )
 //      diff[0] = 127 (neutral). floorDiv is FLOOR division, not truncating —
 //      see floorDiv() below, do not replace with a plain `/`.
+//   4. fast_frame / slow_frame values passed to the model are RAW 0-255
+//      float32 — do NOT divide by 255 in packFrame:diff:. The exported
+//      CoreML graph already does `x * (1.0/255.0)` internally (traced from
+//      CausalSwipeAnnotator._cnn_features in convert_to_coreml.py's
+//      StepWrapper). Normalizing here too silently shrinks the real signal
+//      by ~255x relative to the CNN's bias terms and effectively blinds the
+//      model to the frame — see packFrame:diff: for the full explanation.
+//   5. h_fast_in / h_slow_in are carried indefinitely for the whole session
+//      (only zeroed once, in resetSession) — this is the model's intended
+//      streaming design (see model_causal.py's step()/init_state() docs),
+//      not a bug to "fix" by periodic resets.
 //
 // If any of this drifts from the training pipeline, inference silently
 // produces wrong (but plausible-looking) predictions — no crash, no error.
@@ -191,6 +202,19 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 }
 
 - (MLMultiArray *)packFrame:(NSData *)gray diff:(NSData *)diff {
+    // DO NOT divide by 255 here. The exported CoreML model's forward pass
+    // (StepWrapper -> CausalSwipeAnnotator._cnn_features) does
+    // `x = x.to(float32) * (1.0/255.0)` INTERNALLY — that normalization is
+    // traced straight into the .mlmodel graph. This function must hand the
+    // model raw 0-255 values (as float32), exactly like fast_frame's input
+    // description says: "normalized 0-255 uint8 range". Dividing by 255
+    // here on top of that produces inputs in ~[0, 0.0039] instead of
+    // [0, 255] — a ~255x scale-down that drowns the real per-pixel signal
+    // under the CNN's (scale-invariant-to-this-bug) bias terms, leaving the
+    // GRU fed an almost frame-invariant feature vector every tick. That's
+    // the double-normalization bug that was causing det/dirConf to freeze
+    // near-flat within the first second and stay there regardless of
+    // on-screen content — see AIPlayer.xm diagnosis notes.
     NSError *err = nil;
     MLMultiArray *arr = [[MLMultiArray alloc] initWithShape:@[@1, @2, @(kImgSize), @(kImgSize)]
                                                      dataType:MLMultiArrayDataTypeFloat32
@@ -199,8 +223,8 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     const uint8_t *g = (const uint8_t *)gray.bytes, *d = (const uint8_t *)diff.bytes;
     NSInteger n = kImgSize * kImgSize;
     for (NSInteger i = 0; i < n; i++) {
-        dst[i]     = g[i] * (1.0f / 255.0f);
-        dst[n + i] = d[i] * (1.0f / 255.0f);
+        dst[i]     = (float)g[i];
+        dst[n + i] = (float)d[i];
     }
     return arr;
 }
