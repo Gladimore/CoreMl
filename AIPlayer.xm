@@ -584,6 +584,10 @@ static NSURL *AIPlayerModelURL(void) {
 @property (nonatomic, assign) BOOL isPlaying;
 @property (nonatomic, assign) NSInteger frameTick;
 @property (nonatomic, assign) CFTimeInterval lastInjectTime;
+// TEMP DIAGNOSTIC — total frames the ReplayKit handler has seen vs. how many
+// made it past the FPS throttle into actual processing this session.
+@property (nonatomic, assign) NSInteger diagFramesReceived;
+@property (nonatomic, assign) NSInteger diagFramesProcessed;
 @end
 
 @implementation AIOverlayVC
@@ -636,6 +640,11 @@ static NSURL *AIPlayerModelURL(void) {
 }
 
 - (void)toggleTapped {
+    // TEMP DIAGNOSTIC — catches double-fire (e.g. the drag gesture recognizer
+    // on the button interacting with UIControlEventTouchUpInside and causing
+    // two toggles per tap, which would flip isPlaying back off silently).
+    NSLog(@"[AIPlayer][DIAG] toggleTapped called. isPlaying before flip = %d", self.isPlaying);
+
     self.isPlaying = !self.isPlaying;
     if (self.isPlaying) {
         [self startCapture];
@@ -652,23 +661,64 @@ static NSURL *AIPlayerModelURL(void) {
     [[InferenceEngine sharedEngine] resetSession];
     self.frameTick = 0;
 
+    // TEMP DIAGNOSTIC — reset per-session frame counters (see processCapturedBuffer:).
+    self.diagFramesReceived = 0;
+    self.diagFramesProcessed = 0;
+
+    // TEMP DIAGNOSTIC — snapshot RPScreenRecorder's own state right before
+    // starting. If isRecording is already YES here from a prior session that
+    // never cleanly stopped, startCaptureWithHandler: can behave oddly.
+    RPScreenRecorder *rec = [RPScreenRecorder sharedRecorder];
+    NSLog(@"[AIPlayer][DIAG] pre-start recorder state: isRecording=%d isMicrophoneEnabled=%d isCameraEnabled=%d isAvailable=%d",
+          rec.isRecording, rec.isMicrophoneEnabled, rec.isCameraEnabled, rec.isAvailable);
+
     __weak typeof(self) weakSelf = self;
     [[RPScreenRecorder sharedRecorder]
         startCaptureWithHandler:^(CMSampleBufferRef buf, RPSampleBufferType type, NSError *err) {
+            // TEMP DIAGNOSTIC — logs once per second regardless of the guards
+            // below, so we can see raw frame arrival + which guard (if any)
+            // is dropping every frame. Remove once frames are confirmed
+            // reaching processCapturedBuffer:.
+            __strong typeof(weakSelf) diagSelf = weakSelf;
+            if (diagSelf) diagSelf.diagFramesReceived++;
+
+            static CFTimeInterval lastDiagLog = 0;
+            CFTimeInterval diagNow = CACurrentMediaTime();
+            if (diagNow - lastDiagLog > 1.0) {
+                lastDiagLog = diagNow;
+                NSLog(@"[AIPlayer][DIAG] handler fired: type=%ld err=%@ selfAlive=%d isPlaying=%d "
+                      @"totalReceived=%ld totalProcessed=%ld",
+                      (long)type, err, diagSelf != nil, diagSelf.isPlaying,
+                      (long)diagSelf.diagFramesReceived, (long)diagSelf.diagFramesProcessed);
+            }
+
             if (type != RPSampleBufferTypeVideo || err) return;
             __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf || !strongSelf.isPlaying) return;
             [strongSelf processCapturedBuffer:buf];
         }
         completionHandler:^(NSError *err) {
-            if (err) NSLog(@"[AIPlayer] startCapture error: %@", err);
-            else NSLog(@"[AIPlayer] Capture started.");
+            // TEMP DIAGNOSTIC — fully expanded error info instead of just %@,
+            // since NSError's default description can hide the domain/code
+            // that actually tells us what failed.
+            if (err) {
+                NSLog(@"[AIPlayer] startCapture error: domain=%@ code=%ld description=%@ userInfo=%@",
+                      err.domain, (long)err.code, err.localizedDescription, err.userInfo);
+            } else {
+                NSLog(@"[AIPlayer] Capture started.");
+            }
         }];
 }
 
 - (void)stopCapture {
+    // TEMP DIAGNOSTIC — expanded error info, same rationale as startCapture's completion handler.
     [[RPScreenRecorder sharedRecorder] stopCaptureWithHandler:^(NSError *err) {
-        NSLog(@"[AIPlayer] Capture stopped%@", err ? [NSString stringWithFormat:@" (error: %@)", err] : @"");
+        if (err) {
+            NSLog(@"[AIPlayer] Capture stopped (error: domain=%@ code=%ld description=%@)",
+                  err.domain, (long)err.code, err.localizedDescription);
+        } else {
+            NSLog(@"[AIPlayer] Capture stopped.");
+        }
     }];
 }
 
@@ -679,8 +729,31 @@ static NSURL *AIPlayerModelURL(void) {
     if (now - lastTime < (1.0 / kTargetFPS)) return;
     lastTime = now;
 
+    self.diagFramesProcessed++;
+
     CVImageBufferRef px = CMSampleBufferGetImageBuffer(buf);
-    if (!px) return;
+    if (!px) {
+        NSLog(@"[AIPlayer][DIAG] CMSampleBufferGetImageBuffer returned NULL on frame %ld", (long)self.diagFramesProcessed);
+        return;
+    }
+
+    // TEMP DIAGNOSTIC — dump pixel buffer format/dimensions once, on the
+    // first frame that reaches this point. Confirms the capture buffer
+    // actually looks like a normal screen frame (right size, known pixel
+    // format) rather than something degenerate.
+    static BOOL diagLoggedFormat = NO;
+    if (!diagLoggedFormat) {
+        diagLoggedFormat = YES;
+        size_t w = CVPixelBufferGetWidth(px);
+        size_t h = CVPixelBufferGetHeight(px);
+        OSType fmt = CVPixelBufferGetPixelFormatType(px);
+        char fmtChars[5] = {
+            (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
+            (char)((fmt >> 8) & 0xFF),  (char)(fmt & 0xFF), 0
+        };
+        NSLog(@"[AIPlayer][DIAG] first pixel buffer: %zux%zu format='%s' (0x%08X)",
+              w, h, fmtChars, fmt);
+    }
 
     self.frameTick++;
     BOOL hasNewSlow = (self.frameTick % kSlowBranchEveryNTicks) == 0;
@@ -690,8 +763,28 @@ static NSURL *AIPlayerModelURL(void) {
                                                                    hasNewSlowFrame:hasNewSlow
                                                                               error:&err];
     if (!pred) {
-        if (err) NSLog(@"[AIPlayer] predict error: %@", err);
+        // TEMP DIAGNOSTIC — fully expanded error, same rationale as above.
+        if (err) {
+            NSLog(@"[AIPlayer] predict error: domain=%@ code=%ld description=%@ userInfo=%@",
+                  err.domain, (long)err.code, err.localizedDescription, err.userInfo);
+        } else {
+            NSLog(@"[AIPlayer][DIAG] predictWithPixelBuffer returned nil with no error set (frame %ld)",
+                  (long)self.diagFramesProcessed);
+        }
         return;
+    }
+
+    // TEMP DIAGNOSTIC — log the raw model output once per second regardless
+    // of threshold, so we can see whether the model is producing sane,
+    // near-threshold, or completely flat/degenerate values even when it
+    // never actually crosses kDetectionThreshold.
+    static CFTimeInterval lastPredDiagLog = 0;
+    CFTimeInterval predDiagNow = CACurrentMediaTime();
+    if (predDiagNow - lastPredDiagLog > 1.0) {
+        lastPredDiagLog = predDiagNow;
+        NSLog(@"[AIPlayer][DIAG] pred: det=%.3f dir=%ld dirConf=%.3f threshold=%.2f frame=%ld",
+              pred.detProbability, (long)pred.direction, pred.dirConfidence,
+              kDetectionThreshold, (long)self.diagFramesProcessed);
     }
 
     if (pred.detProbability >= kDetectionThreshold) {
