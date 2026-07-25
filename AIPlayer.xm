@@ -438,7 +438,8 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 // session instead of crashing the host game process.
 // =============================================================================
 
-@class AIOverlayWindow;
+@interface AIOverlayWindow : UIWindow
+@end
 
 // ---- private selectors this relies on (all confirmed present as of KIF
 //      v3.12.3's source, the release with the explicit iOS 26 fix) ----
@@ -586,7 +587,15 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
 - (nullable UIWindow *)targetWindow {
     UIApplication *app = [UIApplication sharedApplication];
     UIWindow *fallback = nil;
-    for (UIWindow *w in app.windows) {
+
+    NSMutableArray<UIWindow *> *candidateWindows = [NSMutableArray array];
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        [candidateWindows addObjectsFromArray:windowScene.windows];
+    }
+
+    for (UIWindow *w in candidateWindows) {
         if ([w isKindOfClass:[AIOverlayWindow class]]) continue;   // that's our own toggle-button window, not the game
         if (w.isKeyWindow) return w;
         if (!fallback) fallback = w;
@@ -710,9 +719,6 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
 // the key window, so the game's window keeps first-responder/key status
 // at all times — this window only ever exists to host the toggle button.
 // =============================================================================
-
-@interface AIOverlayWindow : UIWindow
-@end
 
 @implementation AIOverlayWindow
 
