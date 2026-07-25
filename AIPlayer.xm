@@ -521,7 +521,20 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
         kCFAllocatorDefault, timeStamp, kAIPlayerIOHIDDigitizerTransducerTypeHand,
         0, 0, kAIPlayerIOHIDDigitizerEventTouchFlag, 0,
         0, 0, 0, 0, 0, 0, true, 0);
-    if (!handEvent) return NULL;
+    if (!handEvent) {
+        // TEMP DIAGNOSTIC — if this fires, IOHIDEventCreateDigitizerEvent
+        // itself is failing (likely a sandbox/entitlement rejection under
+        // Sideloadly injection), not a downstream dispatch problem. Every
+        // touch built from this point on has no real HID backing.
+        static CFTimeInterval lastLog = 0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastLog > 2.0) {
+            lastLog = now;
+            os_log(AIPlayerLog(), "[DIAG] IOHIDEventCreateDigitizerEvent returned NULL — "
+                  "hand event construction failed, no HID event will be attached");
+        }
+        return NULL;
+    }
     IOHIDEventSetIntegerValue(handEvent, kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
 
     NSUInteger idx = 0;
@@ -649,6 +662,14 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
     [event _clearTouches];
 
     IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
+    // TEMP DIAGNOSTIC — once per swipe (Began only, to avoid log spam across
+    // the 8 Moved steps), confirm whether a real HID event was attached.
+    // NULL here means the touch reaching sendEvent: below has no HID
+    // backing at all, even though sendEvent: itself won't complain.
+    if (phase == UITouchPhaseBegan) {
+        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: hidEvent=%{public}s",
+              hidEvent ? "attached" : "NULL (no HID backing)");
+    }
     if (hidEvent) {
         [event _setHIDEvent:hidEvent];
         CFRelease(hidEvent);
