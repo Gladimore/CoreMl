@@ -572,7 +572,7 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
         if (![UITouch instancesRespondToSelector:@selector(setWindow:)]) [missing addObject:@"-[UITouch setWindow:]"];
 
         if (missing.count > 0) {
-            NSLog(@"[AIPlayer] InProcessTouchInjector: unsupported on this iOS build, missing: %@",
+            NSLog(@"[AIPlayer] InProcessTouchInjector: unsupported on this iOS build, missing: %{public}@",
                   [missing componentsJoinedByString:@", "]);
             supported = NO;
         } else {
