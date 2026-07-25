@@ -458,6 +458,14 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 
 @interface UIApplication (AIPlayerPrivateTouch)
 - (UIEvent *)_touchesEvent;
+// SPECULATIVE — selector name only confirmed present via method-list dump;
+// argument types below are a guess from the selector shape (touches set,
+// the event, and "touchable" -- presumably the target view/window), not a
+// verified signature. May be for Pencil-style estimated-touch updates
+// specifically rather than general touch registration -- semantics unknown.
+// Wrapped in a respondsToSelector: + NSInvocation-free direct call, and the
+// whole attempt is easy to strip if it doesn't pan out.
+- (void)_registerEstimatedTouches:(NSSet<UITouch *> *)touches event:(UIEvent *)event forTouchable:(id)touchable;
 @end
 
 @interface UIEvent (AIPlayerPrivateTouch)
@@ -690,14 +698,32 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
     }
     if (hidEvent) CFRelease(hidEvent);
 
-    // TEMP DIAGNOSTIC — once per swipe, confirm what -_touchesEvent reports
-    // as its current touch set right before sendEvent:. If allTouches is
-    // empty/nil here, UIKit is NOT auto-deriving touches from the HID event
-    // the way the hypothesis above assumes, and this approach needs rework
-    // (see Option 2 / Option 3 discussed alongside this change).
+    // RESULT of the previous attempt: event.allTouches.count was 0 on nearly
+    // every swipe -- attaching the HID event alone does NOT make UIKit
+    // auto-populate the touch set. That hypothesis is disproven.
+    //
+    // NEXT ATTEMPT (speculative) -- try -[UIApplication
+    // _registerEstimatedTouches:event:forTouchable:]. Selector name only, no
+    // confirmed signature or semantics; may be Pencil-specific. Guarded by
+    // respondsToSelector: so a mismatched signature just no-ops instead of
+    // crashing if the real signature differs from our guess.
+    if (phase == UITouchPhaseBegan &&
+        [app respondsToSelector:@selector(_registerEstimatedTouches:event:forTouchable:)]) {
+        UIView *touchable = touch.view ?: (id)[self targetWindow];
+        @try {
+            [app _registerEstimatedTouches:[NSSet setWithObject:touch] event:event forTouchable:touchable];
+            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: called, no exception");
+        } @catch (NSException *ex) {
+            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: threw: %{public}@ %{public}@",
+                  ex.name, ex.reason);
+        }
+    }
+
+    // TEMP DIAGNOSTIC — allTouches.count AFTER the registration attempt
+    // above, so we can tell whether it changed anything.
     if (phase == UITouchPhaseBegan) {
         NSSet *all = [event respondsToSelector:@selector(allTouches)] ? [event allTouches] : nil;
-        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: event.allTouches.count=%lu",
+        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: event.allTouches.count=%lu (post-register attempt)",
               (unsigned long)all.count);
     }
 
