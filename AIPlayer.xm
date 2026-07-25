@@ -44,9 +44,21 @@
 #import <CoreImage/CoreImage.h>
 #import <CoreML/CoreML.h>
 #import <objc/runtime.h>
+#include <os/log.h>
 #include <math.h>
 #include <mach/mach_time.h>
 #include <mach-o/dyld.h>
+
+// Shared log handle for the tweak. Using a custom subsystem/category makes
+// it easy to filter in Console.app / iMazing's console viewer.
+static os_log_t AIPlayerLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("com.aiplayer.tweak", "AIPlayer");
+    });
+    return log;
+}
 
 // ── Model config — MUST match your checkpoint's arch dict + dataset meta ───
 static const NSInteger kImgSize     = 128;   // meta['img_size'] — CONFIRM against your dataset
@@ -360,8 +372,8 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
     self = [super init];
     if (self) {
         _client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-        if (!_client) NSLog(@"[AIPlayer] TouchInjector: IOHIDEventSystemClientCreate returned NULL "
-                            @"(expected on a non-jailbroken device — injection will no-op)");
+        if (!_client) os_log(AIPlayerLog(), "TouchInjector: IOHIDEventSystemClientCreate returned NULL "
+                            "(expected on a non-jailbroken device — injection will no-op)");
     }
     return self;
 }
@@ -572,13 +584,13 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
         if (![UITouch instancesRespondToSelector:@selector(setWindow:)]) [missing addObject:@"-[UITouch setWindow:]"];
 
         if (missing.count > 0) {
-            NSLog(@"[AIPlayer] InProcessTouchInjector: unsupported on this iOS build, missing: %{public}@",
+            os_log(AIPlayerLog(), "InProcessTouchInjector: unsupported on this iOS build, missing: %{public}@",
                   [missing componentsJoinedByString:@", "]);
             supported = NO;
         } else {
             UIEvent *probe = [app _touchesEvent];
             supported = (probe != nil);
-            if (!supported) NSLog(@"[AIPlayer] InProcessTouchInjector: -[UIApplication _touchesEvent] returned nil");
+            if (!supported) os_log(AIPlayerLog(), "InProcessTouchInjector: -[UIApplication _touchesEvent] returned nil");
         }
     });
     return supported && !([InProcessTouchInjector sharedInjector].hasFailedThisSession);
@@ -656,7 +668,7 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
         @try {
             UIWindow *window = [self targetWindow];
             if (!window) {
-                NSLog(@"[AIPlayer] InProcessTouchInjector: no target window found");
+                os_log(AIPlayerLog(), "InProcessTouchInjector: no target window found");
                 return;
             }
 
@@ -692,10 +704,10 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
 
 - (void)handleFailure:(NSException *)ex {
     _disabledAfterFailure = YES;
-    NSLog(@"[AIPlayer] InProcessTouchInjector: %@ (%@) -- one of the private selectors this "
-          @"relies on didn't behave as expected on this iOS build. Disabling in-process "
-          @"injection for the rest of this session; TouchInjector (system HID) remains as "
-          @"the fallback path, though it will itself no-op without a jailbreak.",
+    os_log(AIPlayerLog(), "InProcessTouchInjector: %{public}@ (%{public}@) -- one of the private selectors this "
+          "relies on didn't behave as expected on this iOS build. Disabling in-process "
+          "injection for the rest of this session; TouchInjector (system HID) remains as "
+          "the fallback path, though it will itself no-op without a jailbreak.",
           ex.name, ex.reason);
 }
 
@@ -838,8 +850,8 @@ static NSString *AIPlayerFindDirectoryNamed(NSString *filename, NSString *root, 
 static NSURL *AIPlayerModelURL(void) {
     NSString *dylibDir  = AIPlayerDylibDirectory();
     NSString *bundleDir = [NSBundle mainBundle].bundlePath;
-    NSLog(@"[AIPlayer] Derived dylib directory = %@", dylibDir ?: @"(nil)");
-    NSLog(@"[AIPlayer] Main bundle directory = %@", bundleDir ?: @"(nil)");
+    os_log(AIPlayerLog(), "Derived dylib directory = %@", dylibDir ?: @"(nil)");
+    os_log(AIPlayerLog(), "Main bundle directory = %@", bundleDir ?: @"(nil)");
 
     static NSString *const kModelName = @"SwipeAnnotator.mlmodelc";
 
@@ -870,9 +882,9 @@ static NSURL *AIPlayerModelURL(void) {
     }
 
     for (NSString *candidate in candidates) {
-        NSLog(@"[AIPlayer] Trying candidate (leaf=%@): %@", candidate.lastPathComponent, candidate);
+        os_log(AIPlayerLog(), "Trying candidate (leaf=%{public}@): %@", candidate.lastPathComponent, candidate);
         if ([[NSFileManager defaultManager] fileExistsAtPath:candidate]) {
-            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc at: %@", candidate);
+            os_log(AIPlayerLog(), "Found SwipeAnnotator.mlmodelc at: %@", candidate);
             return [NSURL fileURLWithPath:candidate isDirectory:YES];
         }
     }
@@ -881,26 +893,26 @@ static NSURL *AIPlayerModelURL(void) {
     // Sideloadly injection this is the only place an injected bundle could
     // plausibly be, so we search here instead of any system/jailbreak path.
     if (bundleDir) {
-        NSLog(@"[AIPlayer] Scanning under app bundle: %@", bundleDir);
+        os_log(AIPlayerLog(), "Scanning under app bundle: %@", bundleDir);
         NSString *found = AIPlayerFindDirectoryNamed(kModelName, bundleDir, /*maxDepth=*/4);
         if (found) {
-            NSLog(@"[AIPlayer] Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
+            os_log(AIPlayerLog(), "Found SwipeAnnotator.mlmodelc via fallback scan at: %@", found);
             return [NSURL fileURLWithPath:found isDirectory:YES];
         }
-        NSLog(@"[AIPlayer] Scan under app bundle found nothing");
+        os_log(AIPlayerLog(), "Scan under app bundle found nothing");
     }
 
-    NSLog(@"[AIPlayer] Exhausted all lookups -- model not found. "
-          @"This build expects a non-jailbroken, Sideloadly-injected "
-          @"deployment: SwipeAnnotator.mlmodelc must be injected as a "
-          @"bundle/framework alongside AIPlayer.dylib (Sideloadly's "
-          @"'inject dylib/framework/bundle' option), NOT packaged as a "
-          @".deb -- there is no jailbreak root on this device for a .deb "
-          @"install to land in. If this persists, use Sideloadly's log "
-          @"viewer or `log stream --private` on-device to see exactly "
-          @"where AIPlayer.dylib and its bundle were actually placed "
-          @"inside the .app, and compare that against the candidates "
-          @"this function tries.");
+    os_log(AIPlayerLog(), "Exhausted all lookups -- model not found. "
+          "This build expects a non-jailbroken, Sideloadly-injected "
+          "deployment: SwipeAnnotator.mlmodelc must be injected as a "
+          "bundle/framework alongside AIPlayer.dylib (Sideloadly's "
+          "'inject dylib/framework/bundle' option), NOT packaged as a "
+          ".deb -- there is no jailbreak root on this device for a .deb "
+          "install to land in. If this persists, use Sideloadly's log "
+          "viewer or `log stream --private` on-device to see exactly "
+          "where AIPlayer.dylib and its bundle were actually placed "
+          "inside the .app, and compare that against the candidates "
+          "this function tries.");
     return nil;
 }
 
@@ -949,12 +961,12 @@ static NSURL *AIPlayerModelURL(void) {
     if (modelURL) {
         NSError *err = nil;
         if (![[InferenceEngine sharedEngine] loadModelAtURL:modelURL error:&err]) {
-            NSLog(@"[AIPlayer] Failed to load model: %@", err);
+            os_log(AIPlayerLog(), "Failed to load model: %{public}@", err);
         } else {
-            NSLog(@"[AIPlayer] Model loaded from %@", modelURL);
+            os_log(AIPlayerLog(), "Model loaded from %@", modelURL);
         }
     } else {
-        NSLog(@"[AIPlayer] Model not loaded -- SwipeAnnotator.mlmodelc was not found (see preceding log lines for paths checked)");
+        os_log(AIPlayerLog(), "Model not loaded -- SwipeAnnotator.mlmodelc was not found (see preceding log lines for paths checked)");
     }
 }
 
@@ -968,7 +980,7 @@ static NSURL *AIPlayerModelURL(void) {
     // TEMP DIAGNOSTIC — catches double-fire (e.g. the drag gesture recognizer
     // on the button interacting with UIControlEventTouchUpInside and causing
     // two toggles per tap, which would flip isPlaying back off silently).
-    NSLog(@"[AIPlayer][DIAG] toggleTapped called. isPlaying before flip = %d", self.isPlaying);
+    os_log(AIPlayerLog(), "[DIAG] toggleTapped called. isPlaying before flip = %d", self.isPlaying);
 
     self.isPlaying = !self.isPlaying;
     if (self.isPlaying) {
@@ -994,7 +1006,7 @@ static NSURL *AIPlayerModelURL(void) {
     // starting. If isRecording is already YES here from a prior session that
     // never cleanly stopped, startCaptureWithHandler: can behave oddly.
     RPScreenRecorder *rec = [RPScreenRecorder sharedRecorder];
-    NSLog(@"[AIPlayer][DIAG] pre-start recorder state: isRecording=%d isMicrophoneEnabled=%d isCameraEnabled=%d isAvailable=%d",
+    os_log(AIPlayerLog(), "[DIAG] pre-start recorder state: isRecording=%d isMicrophoneEnabled=%d isCameraEnabled=%d isAvailable=%d",
           rec.isRecording, rec.isMicrophoneEnabled, rec.isCameraEnabled, rec.isAvailable);
 
     __weak typeof(self) weakSelf = self;
@@ -1011,8 +1023,8 @@ static NSURL *AIPlayerModelURL(void) {
             CFTimeInterval diagNow = CACurrentMediaTime();
             if (diagNow - lastDiagLog > 1.0) {
                 lastDiagLog = diagNow;
-                NSLog(@"[AIPlayer][DIAG] handler fired: type=%ld err=%@ selfAlive=%d isPlaying=%d "
-                      @"totalReceived=%ld totalProcessed=%ld",
+                os_log(AIPlayerLog(), "[DIAG] handler fired: type=%ld err=%{public}@ selfAlive=%d isPlaying=%d "
+                      "totalReceived=%ld totalProcessed=%ld",
                       (long)type, err, diagSelf != nil, diagSelf.isPlaying,
                       (long)diagSelf.diagFramesReceived, (long)diagSelf.diagFramesProcessed);
             }
@@ -1027,10 +1039,10 @@ static NSURL *AIPlayerModelURL(void) {
             // since NSError's default description can hide the domain/code
             // that actually tells us what failed.
             if (err) {
-                NSLog(@"[AIPlayer] startCapture error: domain=%@ code=%ld description=%@ userInfo=%@",
+                os_log(AIPlayerLog(), "startCapture error: domain=%{public}@ code=%ld description=%{public}@ userInfo=%{public}@",
                       err.domain, (long)err.code, err.localizedDescription, err.userInfo);
             } else {
-                NSLog(@"[AIPlayer] Capture started.");
+                os_log(AIPlayerLog(), "Capture started.");
             }
         }];
 }
@@ -1039,10 +1051,10 @@ static NSURL *AIPlayerModelURL(void) {
     // TEMP DIAGNOSTIC — expanded error info, same rationale as startCapture's completion handler.
     [[RPScreenRecorder sharedRecorder] stopCaptureWithHandler:^(NSError *err) {
         if (err) {
-            NSLog(@"[AIPlayer] Capture stopped (error: domain=%@ code=%ld description=%@)",
+            os_log(AIPlayerLog(), "Capture stopped (error: domain=%{public}@ code=%ld description=%{public}@)",
                   err.domain, (long)err.code, err.localizedDescription);
         } else {
-            NSLog(@"[AIPlayer] Capture stopped.");
+            os_log(AIPlayerLog(), "Capture stopped.");
         }
     }];
 }
@@ -1058,7 +1070,7 @@ static NSURL *AIPlayerModelURL(void) {
 
     CVImageBufferRef px = CMSampleBufferGetImageBuffer(buf);
     if (!px) {
-        NSLog(@"[AIPlayer][DIAG] CMSampleBufferGetImageBuffer returned NULL on frame %ld", (long)self.diagFramesProcessed);
+        os_log(AIPlayerLog(), "[DIAG] CMSampleBufferGetImageBuffer returned NULL on frame %ld", (long)self.diagFramesProcessed);
         return;
     }
 
@@ -1076,7 +1088,7 @@ static NSURL *AIPlayerModelURL(void) {
             (char)((fmt >> 24) & 0xFF), (char)((fmt >> 16) & 0xFF),
             (char)((fmt >> 8) & 0xFF),  (char)(fmt & 0xFF), 0
         };
-        NSLog(@"[AIPlayer][DIAG] first pixel buffer: %zux%zu format='%s' (0x%08X)",
+        os_log(AIPlayerLog(), "[DIAG] first pixel buffer: %zux%zu format='%{public}s' (0x%08X)",
               w, h, fmtChars, fmt);
     }
 
@@ -1090,10 +1102,10 @@ static NSURL *AIPlayerModelURL(void) {
     if (!pred) {
         // TEMP DIAGNOSTIC — fully expanded error, same rationale as above.
         if (err) {
-            NSLog(@"[AIPlayer] predict error: domain=%@ code=%ld description=%@ userInfo=%@",
+            os_log(AIPlayerLog(), "predict error: domain=%{public}@ code=%ld description=%{public}@ userInfo=%{public}@",
                   err.domain, (long)err.code, err.localizedDescription, err.userInfo);
         } else {
-            NSLog(@"[AIPlayer][DIAG] predictWithPixelBuffer returned nil with no error set (frame %ld)",
+            os_log(AIPlayerLog(), "[DIAG] predictWithPixelBuffer returned nil with no error set (frame %ld)",
                   (long)self.diagFramesProcessed);
         }
         return;
@@ -1107,7 +1119,7 @@ static NSURL *AIPlayerModelURL(void) {
     CFTimeInterval predDiagNow = CACurrentMediaTime();
     if (predDiagNow - lastPredDiagLog > 1.0) {
         lastPredDiagLog = predDiagNow;
-        NSLog(@"[AIPlayer][DIAG] pred: det=%.3f dir=%ld dirConf=%.3f threshold=%.2f frame=%ld",
+        os_log(AIPlayerLog(), "[DIAG] pred: det=%.3f dir=%ld dirConf=%.3f threshold=%.2f frame=%ld",
               pred.detProbability, (long)pred.direction, pred.dirConfidence,
               kDetectionThreshold, (long)self.diagFramesProcessed);
     }
@@ -1119,13 +1131,13 @@ static NSURL *AIPlayerModelURL(void) {
             // certainly the same physical swipe crossing threshold on a
             // second consecutive tick. Log it for visibility but don't
             // double-fire.
-            NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f — suppressed (cooldown)",
+            os_log(AIPlayerLog(), "swipe dir=%ld conf=%.2f det=%.2f — suppressed (cooldown)",
                   (long)pred.direction, pred.dirConfidence, pred.detProbability);
             return;
         }
         self.lastInjectTime = nowTime;
 
-        NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f — injecting",
+        os_log(AIPlayerLog(), "swipe dir=%ld conf=%.2f det=%.2f — injecting",
               (long)pred.direction, pred.dirConfidence, pred.detProbability);
         [self injectSwipeForDirection:pred.direction confidence:pred.dirConfidence detection:pred.detProbability];
     }
@@ -1170,9 +1182,9 @@ static NSURL *AIPlayerModelURL(void) {
         CFTimeInterval now = CACurrentMediaTime();
         if (now - lastUnavailableLog > 5.0) {
             lastUnavailableLog = now;
-            NSLog(@"[AIPlayer] swipe dir=%ld conf=%.2f det=%.2f — model fired correctly but "
-                  @"neither InProcessTouchInjector nor TouchInjector can deliver on this "
-                  @"install; swipe NOT delivered", (long)dir, conf, det);
+            os_log(AIPlayerLog(), "swipe dir=%ld conf=%.2f det=%.2f — model fired correctly but "
+                  "neither InProcessTouchInjector nor TouchInjector can deliver on this "
+                  "install; swipe NOT delivered", (long)dir, conf, det);
         }
         return;
     }
