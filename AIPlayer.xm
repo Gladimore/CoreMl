@@ -1234,8 +1234,64 @@ static NSURL *AIPlayerModelURL(void) {
 @end
 
 // =============================================================================
-// MARK: - Entry point
+// MARK: - Runtime introspection dump (diagnostic-only)
+//
+// InProcessTouchInjector's +isSupported logged that -[UIEvent _clearTouches]
+// and -[UIEvent _addTouch:forDelayedDelivery:] are gone on this iOS build.
+// Rather than guess at replacement names, dump every instance method UIEvent,
+// UITouch, and UIApplication actually respond to on THIS device/iOS version
+// right now, so the real current selector names can be read straight out of
+// the Console log instead of inferred from a KIF version that may predate
+// this iOS release.
+//
+// Runs once, ~200ms after launch (after the swizzle/class-loading dust
+// settles), and only logs -- doesn't touch any injection behavior. Safe to
+// leave in during this investigation phase; strip it once the replacement
+// selectors are found and wired in.
 // =============================================================================
+
+static void AIPlayerDumpMethods(Class cls, NSString *label) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) {
+        os_log(AIPlayerLog(), "[DIAG] %{public}@: class_copyMethodList returned NULL", label);
+        return;
+    }
+    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:count];
+    for (unsigned int i = 0; i < count; i++) {
+        [names addObject:NSStringFromSelector(method_getName(methods[i]))];
+    }
+    free(methods);
+    [names sortUsingSelector:@selector(compare:)];
+    os_log(AIPlayerLog(), "[DIAG] %{public}@ (%u methods):", label, count);
+    for (NSString *n in names) {
+        os_log(AIPlayerLog(), "[DIAG]   %{public}@ %{public}@", label, n);
+    }
+}
+
+static void AIPlayerDumpTouchAPISurface(void) {
+    // Instance methods only (class_copyMethodList on the class object itself
+    // would give class/+ methods -- +load, +new, etc. -- which aren't what
+    // we're after here; the private touch-delivery API is all -instance).
+    AIPlayerDumpMethods(object_getClass([UIEvent class]) ? [UIEvent class] : Nil, @"UIEvent");
+    AIPlayerDumpMethods([UITouch class], @"UITouch");
+    AIPlayerDumpMethods([UIApplication class], @"UIApplication");
+
+    // Also walk UIEvent's superclass chain -- if touch-set mutation moved to
+    // a new internal base class (e.g. some private _UIInternalEvent) rather
+    // than staying on UIEvent itself, a plain class dump above would miss it
+    // entirely, so log the chain to know whether that's worth checking too.
+    Class c = [UIEvent class];
+    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+    while (c) {
+        [chain addObject:NSStringFromClass(c)];
+        c = class_getSuperclass(c);
+    }
+    os_log(AIPlayerLog(), "[DIAG] UIEvent superclass chain: %{public}@",
+          [chain componentsJoinedByString:@" -> "]);
+}
+
+
 
 __attribute__((constructor))
 static void AIPlayerInit(void) {
@@ -1251,5 +1307,14 @@ static void AIPlayerInit(void) {
         win.backgroundColor = [UIColor clearColor];
         win.rootViewController = [AIOverlayVC new];
         win.hidden = NO;
+    });
+
+    // TEMP DIAGNOSTIC — one-shot dump of the real UIEvent/UITouch/
+    // UIApplication method surface on this device's actual iOS build.
+    // 200ms delay: give UIKit's own class loading/swizzling time to settle
+    // before enumerating, so the dump reflects final runtime state.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        AIPlayerDumpTouchAPISurface();
     });
 }
