@@ -461,8 +461,8 @@ static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
 @end
 
 @interface UIEvent (AIPlayerPrivateTouch)
-- (void)_clearTouches;
-- (void)_addTouch:(UITouch *)touch forDelayedDelivery:(BOOL)delayed;
+// -_clearTouches and -_addTouch:forDelayedDelivery: removed here -- confirmed
+// gone on iOS 26.5 via live method-list dump, not called anywhere anymore.
 - (void)_setHIDEvent:(IOHIDEventRef)event;
 @end
 
@@ -587,9 +587,16 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
         UIApplication *app = [UIApplication sharedApplication];
         NSMutableArray<NSString *> *missing = [NSMutableArray array];
 
+        // NOTE: -[UIEvent _clearTouches] and -[UIEvent _addTouch:forDelayedDelivery:]
+        // were dropped from this gate. Confirmed via a live class_copyMethodList
+        // dump on-device (iOS 26.5): UIEvent's touch-mutation API is gone
+        // entirely -- no renamed equivalent exists, superclass chain is just
+        // UIEvent -> NSObject so it didn't move to a base class either.
+        // dispatchTouch:phase: below no longer calls either selector; it
+        // mutates the UITouch directly and re-fetches/sends the app's
+        // -_touchesEvent instead. Everything still checked here (below) was
+        // confirmed PRESENT in that same dump.
         if (![app respondsToSelector:@selector(_touchesEvent)]) [missing addObject:@"-[UIApplication _touchesEvent]"];
-        if (![UIEvent instancesRespondToSelector:@selector(_clearTouches)]) [missing addObject:@"-[UIEvent _clearTouches]"];
-        if (![UIEvent instancesRespondToSelector:@selector(_addTouch:forDelayedDelivery:)]) [missing addObject:@"-[UIEvent _addTouch:forDelayedDelivery:]"];
         if (![UIEvent instancesRespondToSelector:@selector(_setHIDEvent:)]) [missing addObject:@"-[UIEvent _setHIDEvent:]"];
         if (![UITouch instancesRespondToSelector:@selector(_setLocationInWindow:resetPrevious:)]) [missing addObject:@"-[UITouch _setLocationInWindow:resetPrevious:]"];
         if (![UITouch instancesRespondToSelector:@selector(_setHidEvent:)]) [missing addObject:@"-[UITouch _setHidEvent:]"];
@@ -657,24 +664,43 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
     [touch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
     [touch setPhase:phase];
 
-    UIApplication *app = [UIApplication sharedApplication];
-    UIEvent *event = [app _touchesEvent];
-    [event _clearTouches];
-
+    // iOS 26.5 CHANGE: -[UIEvent _clearTouches] and
+    // -[UIEvent _addTouch:forDelayedDelivery:] no longer exist (confirmed via
+    // live method-list dump -- not renamed, just gone; UIEvent's superclass
+    // chain is plain UIEvent -> NSObject, so it didn't move to a base class
+    // either). UIEvent's touch set is no longer externally mutable on this
+    // build. -[UIEvent _setHIDEvent:] is still present, so the working
+    // hypothesis is that UIKit now derives an event's touches from the HID
+    // event's digitizer payload internally, rather than from explicit
+    // _addTouch: calls -- which is also consistent with _setHidEvent: still
+    // being present and settable on UITouch itself.
     IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
-    // TEMP DIAGNOSTIC — once per swipe (Began only, to avoid log spam across
-    // the 8 Moved steps), confirm whether a real HID event was attached.
-    // NULL here means the touch reaching sendEvent: below has no HID
-    // backing at all, even though sendEvent: itself won't complain.
     if (phase == UITouchPhaseBegan) {
         os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: hidEvent=%{public}s",
               hidEvent ? "attached" : "NULL (no HID backing)");
     }
     if (hidEvent) {
-        [event _setHIDEvent:hidEvent];
-        CFRelease(hidEvent);
+        [touch _setHidEvent:hidEvent];
     }
-    [event _addTouch:touch forDelayedDelivery:NO];
+
+    UIApplication *app = [UIApplication sharedApplication];
+    UIEvent *event = [app _touchesEvent];
+    if (hidEvent) {
+        [event _setHIDEvent:hidEvent];
+    }
+    if (hidEvent) CFRelease(hidEvent);
+
+    // TEMP DIAGNOSTIC — once per swipe, confirm what -_touchesEvent reports
+    // as its current touch set right before sendEvent:. If allTouches is
+    // empty/nil here, UIKit is NOT auto-deriving touches from the HID event
+    // the way the hypothesis above assumes, and this approach needs rework
+    // (see Option 2 / Option 3 discussed alongside this change).
+    if (phase == UITouchPhaseBegan) {
+        NSSet *all = [event respondsToSelector:@selector(allTouches)] ? [event allTouches] : nil;
+        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: event.allTouches.count=%lu",
+              (unsigned long)all.count);
+    }
+
     [app sendEvent:event];
 }
 
