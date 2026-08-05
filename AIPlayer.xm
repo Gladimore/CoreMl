@@ -305,7 +305,8 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // MARK: - Passthrough window (forward-declared: DirectTouchInjector below
 // needs to recognize and skip it when picking a dispatch target)
 // =============================================================================
-@class AIOverlayWindow;
+@interface AIOverlayWindow : UIWindow
+@end
 
 // =============================================================================
 // MARK: - DirectTouchInjector — synthesizes swipes via direct responder-chain
@@ -400,7 +401,6 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
     id readBack = [target performSelector:NSSelectorFromString(propName)];
     if (readBack == value) {
-        #pragma clang diagnostic pop
         return;
     }
 
@@ -409,7 +409,6 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     if ([target respondsToSelector:publicSelector]) {
         [target performSelector:publicSelector withObject:value];
         if ([target performSelector:NSSelectorFromString(propName)] == value) {
-            #pragma clang diagnostic pop
             return;
         }
     }
@@ -428,7 +427,7 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
             if (scene.activationState != UISceneActivationStateForegroundActive) continue;
             if (![scene isKindOfClass:[UIWindowScene class]]) continue;
             for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if ([window isKindOfClass:NSClassFromString(@"AIOverlayWindow")]) continue;
+                if ([window isKindOfClass:[AIOverlayWindow class]]) continue;
                 if (window.isKeyWindow) return window;
             }
         }
