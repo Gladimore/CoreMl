@@ -346,6 +346,15 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 
 @implementation DirectTouchInjector {
     UITouch *_activeTouch;
+    // Bumped once per injectSwipeFrom:to:duration: call. Every scheduled
+    // step closure stamps in the generation it was created under and checks
+    // it before touching _activeTouch — a step from a swipe that's since
+    // been superseded by a newer one just no-ops instead of mutating the
+    // newer swipe's touch. Needed because the AI can fire a new swipe every
+    // ~0.15-0.3s, tighter than kSwipeDuration's own step spread, so overlap
+    // under any main-thread jitter is a real (not hypothetical) risk here —
+    // unlike the manual single-tap case this technique was validated against.
+    int64_t _swipeGeneration;
 }
 
 + (instancetype)sharedInjector {
@@ -443,7 +452,10 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // unnecessary; direct dispatch alone is what reached UnityView on-device).
 - (void)dispatchTouchAtPoint:(CGPoint)point phase:(UITouchPhase)phase inOutTouch:(UITouch **)activeTouch {
     UIWindow *keyWindow = [self keyWindow];
-    if (!keyWindow) return;
+    if (!keyWindow) {
+        os_log(AIPlayerLog(), "[DIAG][Touch] dispatchTouchAtPoint aborted — no keyWindow found");
+        return;
+    }
 
     UITouch *touch = *activeTouch;
     BOOL isNewTouch = (!touch || phase == UITouchPhaseBegan);
@@ -454,6 +466,8 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 
         UIView *targetView = [keyWindow hitTest:point withEvent:nil];
         if (!targetView) targetView = keyWindow;
+        os_log(AIPlayerLog(), "[DIAG][Touch] new touch — hitTest at (%.1f, %.1f) -> %{public}@",
+              point.x, point.y, NSStringFromClass([targetView class]));
 
         [self defensiveSetObject:keyWindow forProperty:@"window" onObject:touch];
         [self defensiveSetObject:targetView forProperty:@"view" onObject:touch];
@@ -491,25 +505,39 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     if (targetView) {
         switch (phase) {
             case UITouchPhaseBegan:
-                if ([targetView respondsToSelector:@selector(touchesBegan:withEvent:)])
+                if ([targetView respondsToSelector:@selector(touchesBegan:withEvent:)]) {
                     [targetView touchesBegan:touchesSet withEvent:nil];
+                } else {
+                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesBegan:withEvent:", NSStringFromClass([targetView class]));
+                }
                 break;
             case UITouchPhaseMoved:
-                if ([targetView respondsToSelector:@selector(touchesMoved:withEvent:)])
+                if ([targetView respondsToSelector:@selector(touchesMoved:withEvent:)]) {
                     [targetView touchesMoved:touchesSet withEvent:nil];
+                } else {
+                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesMoved:withEvent:", NSStringFromClass([targetView class]));
+                }
                 break;
             case UITouchPhaseStationary:
                 break;
             case UITouchPhaseEnded:
-                if ([targetView respondsToSelector:@selector(touchesEnded:withEvent:)])
+                if ([targetView respondsToSelector:@selector(touchesEnded:withEvent:)]) {
                     [targetView touchesEnded:touchesSet withEvent:nil];
+                } else {
+                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesEnded:withEvent:", NSStringFromClass([targetView class]));
+                }
                 break;
             case UITouchPhaseCancelled:
             default:
-                if ([targetView respondsToSelector:@selector(touchesCancelled:withEvent:)])
+                if ([targetView respondsToSelector:@selector(touchesCancelled:withEvent:)]) {
                     [targetView touchesCancelled:touchesSet withEvent:nil];
+                } else {
+                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesCancelled:withEvent:", NSStringFromClass([targetView class]));
+                }
                 break;
         }
+    } else {
+        os_log(AIPlayerLog(), "[DIAG][Touch] phase=%ld dispatched nothing — touch.view is nil", (long)phase);
     }
 
     if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) {
@@ -523,8 +551,12 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // that triggered this is never blocked.
 - (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
     dispatch_async(dispatch_get_main_queue(), ^{
-        // If a previous swipe never reached Ended for some reason, finalize
-        // it before starting a new one instead of silently leaking it.
+        int64_t myGeneration = ++self->_swipeGeneration;
+
+        // If a previous swipe is still mid-flight, finalize it immediately.
+        // Its own remaining step closures are now stale and will no-op
+        // below via the generation check, instead of mutating the touch
+        // this new swipe is about to create.
         if (self->_activeTouch) {
             UITouch *temp = self->_activeTouch;
             CGPoint lastPoint = [self readCGPointIvarOnObject:temp name:"_locationInWindow" fallback:start];
@@ -542,6 +574,11 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
         for (NSInteger i = 1; i <= steps; i++) {
             int64_t delayNanos = (int64_t)(stepInterval * i * NSEC_PER_SEC);
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanos), dispatch_get_main_queue(), ^{
+                // A newer swipe has since taken over _activeTouch — this
+                // step belongs to a superseded sequence. Do nothing rather
+                // than corrupt the newer touch with this swipe's coordinates.
+                if (myGeneration != self->_swipeGeneration) return;
+
                 CGFloat t = (CGFloat)i / steps;
                 CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
                                          start.y + (end.y - start.y) * t);
