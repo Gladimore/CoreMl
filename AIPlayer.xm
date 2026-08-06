@@ -4,23 +4,16 @@
 // Shows a small floating "AI: OFF / AI: ON" button. Tapping it starts/stops
 // a screen-capture + Core ML inference loop. Every high-confidence detection
 // is logged AND injected into the game as a synthesized swipe (see
-// DirectTouchInjector below) — the button flashes gold for ~150ms each time
-// a swipe is actually sent, so you can visually confirm firing rate.
+// TouchInjector below) — the button flashes gold for ~150ms each time a
+// swipe is actually sent, so you can visually confirm firing rate.
 //
-// TOUCH SYNTHESIS: DirectTouchInjector below is the technique validated
-// on-device against Subway Surfers (GrayHueCapture/Tweak_5.xm-6.xm): build a
-// real UITouch, write its private ivars directly (window, view, location,
-// phase, timestamp, tapCount, touchFlags), then call
-// touchesBegan/Moved/Ended/Cancelled:withEvent: DIRECTLY on the hit-tested
-// view. No sendEvent:, no hand-built GSEvent/UIEvent struct, no IOHID, no
-// jailbreak required — private ivar access and a plain method call are both
-// available to any process in its own address space. On-device logging
-// proved this is the one path that actually reaches a Unity game's
-// touchesBegan handlers; sendEvent:-based delivery silently dropped
-// well-formed synthetic events with no error and no nil. Validate against
-// on-screen gameplay with AI: ON before trusting it in a real run — this
-// still relies on private ivar names that could change across iOS versions,
-// even though it needs no special entitlements.
+// TouchInjector uses undocumented IOHIDEvent digitizer APIs (the standard
+// jailbreak-tweak technique for synthetic touch input — see the class
+// comment for details and caveats). It only works on a jailbroken device
+// with SpringBoard-level HID access; it will silently no-op on stock iOS.
+// Validate against on-screen gameplay with AI: ON before trusting it in a
+// real run — these are private APIs with no stability guarantee across
+// iOS versions.
 //
 // PREPROCESSING CONTRACT — must exactly match build_dataset_v3_gpu.py:
 //   1. Resize to (kImgSize, kImgSize) via SQUARE STRETCH (not
@@ -53,6 +46,7 @@
 #import <objc/runtime.h>
 #include <os/log.h>
 #include <math.h>
+#include <mach/mach_time.h>
 #include <mach-o/dyld.h>
 
 // Shared log handle for the tweak. Using a custom subsystem/category makes
@@ -73,9 +67,30 @@ static const NSInteger kSlowLayers  = 1;     // arch['slow_layers']
 static const NSInteger kHidden      = 192;   // arch['hidden']
 static const NSInteger kSlowHidden  = kHidden / 2;
 
-static const NSInteger kSlowBranchEveryNTicks = 6;  // VALIDATE against SLOW_OFFSETS spacing
+static const NSInteger kSlowBranchEveryNTicks = 6;  // VALIDATE against SLOW_OFFSETS spacing (19,13 -> stride 6)
 static const float     kDetectionThreshold    = 0.80f;
 static const int       kTargetFPS             = 24;
+
+// ── Slow-branch delay line ──────────────────────────────────────────────────
+// build_dataset_v3_gpu.py builds slow_x from SLOW_OFFSETS=(19,13): two frames
+// strictly older than the fast window, fed to slow_gru in order [-19, -13]
+// from a *zero* hidden state, and forward() takes the hidden state after the
+// LAST step, i.e. after consuming the -13 frame. Deployment instead carries
+// h_slow forward across the whole session (per model_causal.py's documented
+// step()/forward() approximation) and only gets ONE new sample per cadence
+// tick, so there's no single call that can replicate the two-step
+// [-19 -> -13] transition exactly. The closest faithful reproduction is to
+// feed a sample that is ALWAYS exactly kSlowDelayTicks behind "now": that
+// keeps the step size between consecutive slow samples fixed at exactly
+// kSlowBranchEveryNTicks (matching 19->13's spacing) every single time, and
+// kSlowDelayTicks=13 additionally means each fed sample sits at the same
+// offset as the LAST frame slow_gru saw during training, i.e. the same
+// offset whose post-update hidden state forward() actually returns to the
+// heads. This is still the approximation the model docstring flags as
+// needing empirical validation (compare against forward() on a real
+// captured session) — it is not claimed to be exact.
+static const NSInteger kSlowDelayTicks      = 13;
+static const NSInteger kGrayHistoryCapacity = 32;  // must be > kSlowDelayTicks + 1; 32 gives comfortable margin
 
 // ── Touch injection tuning ──────────────────────────────────────────────────
 // kInjectCooldown: minimum gap between two injected swipes. A single real
@@ -118,6 +133,13 @@ typedef NS_ENUM(NSInteger, SwipeDirection) {
 @property (nonatomic, strong, nullable) MLMultiArray *hSlow;
 @property (nonatomic, strong, nullable) NSData *prevGrayBuffer;
 @property (nonatomic, strong) CIContext *ciContext;
+// Ring buffer of this session's (gray, diff) history, so the slow branch can
+// be fed a genuinely-delayed frame instead of "now". Fixed-capacity,
+// pre-filled with NSNull; historyTickCount is the monotonic absolute tick
+// count (0-based) of the most recently pushed frame + 1.
+@property (nonatomic, strong, nullable) NSMutableArray<id> *grayHistory;
+@property (nonatomic, strong, nullable) NSMutableArray<id> *diffHistory;
+@property (nonatomic, assign) NSInteger historyTickCount;
 + (instancetype)sharedEngine;
 - (BOOL)loadModelAtURL:(NSURL *)url error:(NSError **)error;
 - (void)resetSession;
@@ -159,6 +181,19 @@ typedef NS_ENUM(NSInteger, SwipeDirection) {
     self.hFast = [self zerosShape:@[@(kFastLayers), @1, @(kHidden)]];
     self.hSlow = [self zerosShape:@[@(kSlowLayers), @1, @(kSlowHidden)]];
     self.prevGrayBuffer = nil;
+
+    // New session -> no valid history yet. Re-fill with NSNull rather than
+    // leaving stale frames from a previous session sitting in old slots;
+    // historyTickCount=0 means predictWithPixelBuffer: won't attempt to read
+    // a delayed slow sample until kSlowDelayTicks real frames have been
+    // pushed (see the haveEnoughHistory gate there).
+    self.grayHistory = [NSMutableArray arrayWithCapacity:kGrayHistoryCapacity];
+    self.diffHistory  = [NSMutableArray arrayWithCapacity:kGrayHistoryCapacity];
+    for (NSInteger i = 0; i < kGrayHistoryCapacity; i++) {
+        [self.grayHistory addObject:[NSNull null]];
+        [self.diffHistory  addObject:[NSNull null]];
+    }
+    self.historyTickCount = 0;
 }
 
 - (MLMultiArray *)zerosShape:(NSArray<NSNumber *> *)shape {
@@ -261,10 +296,43 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
     NSData *diff = [self diffFromCurrent:gray previous:self.prevGrayBuffer];
     self.prevGrayBuffer = gray;
 
+    // Push this tick's (gray, diff) into the ring buffer BEFORE computing the
+    // delayed slow sample below, so nowTick already reflects "this frame" —
+    // matches diffs.bin's semantics exactly, since `diff` here is already
+    // the ordinary frame[t]-frame[t-1] causal diff (same formula as
+    // build_dataset_v3_gpu.py), just cached per-tick instead of recomputed.
+    NSInteger slot = self.historyTickCount % kGrayHistoryCapacity;
+    self.grayHistory[slot] = gray;
+    self.diffHistory[slot] = diff;
+    NSInteger nowTick = self.historyTickCount;   // 0-based absolute tick of THIS frame
+    self.historyTickCount++;
+
     MLMultiArray *fastFrame = [self packFrame:gray diff:diff];
-    MLMultiArray *slowFrame = hasNewSlow ? fastFrame : [self zerosShape:@[@1, @2, @(kImgSize), @(kImgSize)]];
+
+    // Slow branch: feed a genuinely kSlowDelayTicks-old frame, never "now".
+    // BUG FIX: this used to be `hasNewSlow ? fastFrame : zeros` — i.e. on
+    // every cadence tick it fed the model's own current frame as the "long
+    // range context" sample, which is exactly what the slow branch was
+    // never trained to see (see kSlowDelayTicks comment above). Gate on
+    // real history depth too: early in a session there aren't yet
+    // kSlowDelayTicks frames to look back on, so treat those cadence ticks
+    // as "no slow sample" (has_slow=0) rather than reading garbage/stale
+    // NSNull slots — h_slow simply stays at zero a little longer, which is
+    // harmless and self-corrects within ~0.5s.
+    BOOL haveEnoughHistory = nowTick >= kSlowDelayTicks;
+    BOOL shouldFeedSlow = hasNewSlow && haveEnoughHistory;
+
+    MLMultiArray *slowFrame;
+    if (shouldFeedSlow) {
+        NSInteger delayedTick = nowTick - kSlowDelayTicks;
+        NSData *delayedGray = self.grayHistory[delayedTick % kGrayHistoryCapacity];
+        NSData *delayedDiff = self.diffHistory[delayedTick % kGrayHistoryCapacity];
+        slowFrame = [self packFrame:delayedGray diff:delayedDiff];
+    } else {
+        slowFrame = [self zerosShape:@[@1, @2, @(kImgSize), @(kImgSize)]];
+    }
     MLMultiArray *hasSlowArr = [self zerosShape:@[@1]];
-    hasSlowArr[0] = hasNewSlow ? @1.0f : @0.0f;
+    hasSlowArr[0] = shouldFeedSlow ? @1.0f : @0.0f;
 
     NSDictionary *inputs = @{
         @"fast_frame": [MLFeatureValue featureValueWithMultiArray:fastFrame],
@@ -302,294 +370,492 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 @end
 
 // =============================================================================
-// MARK: - Passthrough window (forward-declared: DirectTouchInjector below
-// needs to recognize and skip it when picking a dispatch target)
-// =============================================================================
-@interface AIOverlayWindow : UIWindow
-@end
-
-// =============================================================================
-// MARK: - DirectTouchInjector — synthesizes swipes via direct responder-chain
-// dispatch. No jailbreak, no IOHID, no sendEvent:.
+// MARK: - TouchInjector — synthesizes swipes via IOHIDEvent digitizer events
 //
-// This replaces two earlier approaches that both lived in this file:
-//   • A system-HID injector (IOHIDEventSystemClientDispatchEvent) — only
-//     ever works on a jailbroken device with SpringBoard-level HID access;
-//     silently no-ops under Sideloadly injection.
-//   • An in-process sendEvent:-based injector (KIF's technique) — never got
-//     a confirmed touch through on this iOS build; -[UIEvent _clearTouches]/
-//     -_addTouch:forDelayedDelivery: are gone, and event.allTouches stayed
-//     empty even after attaching a hand-built IOHIDEvent.
+// This is the standard technique used across jailbreak-tweak touch-simulation
+// tools (e.g. STHIDEventGenerator-style utilities): build IOHIDEvent
+// "digitizer finger" events by hand and dispatch them straight into the HID
+// event system, the same path a real finger's events travel. There is no
+// public API for this — the declarations below are reconstructed from
+// widely-circulated reverse-engineering references, not an Apple header.
 //
-// This is the technique actually validated on-device against Subway
-// Surfers: fully populate a real UITouch's private ivars (window, view,
-// location, phase, timestamp, tapCount, touchFlags — the same set
-// HybridTouchSynthesizer used in the GrayHueCapture project), then call
-// touchesBegan/Moved/Ended/Cancelled:withEvent: DIRECTLY on the hit-tested
-// view. On-device Console.app logging proved this is the one path that
-// actually reaches a Unity game's overridden touch handlers — sendEvent:
-// silently dropped every well-formed synthetic event, no error, no nil.
-// Passing withEvent:nil is confirmed fine: the hit-tested view's override
-// only ever reads locationInView:/phase/timestamp off the touch itself, and
-// never inspects the event object.
+// Caveats (read before relying on this):
+//   • Undocumented/private. Field names, bit values, and behavior can change
+//     between iOS versions with no notice and no deprecation warning.
+//   • Requires SpringBoard-level HID access, which a system-injected dylib
+//     on a jailbroken device has — this will silently do nothing on stock
+//     iOS or in a sandboxed app.
+//   • kIOHIDDigitizerEventSenderID below is a commonly-reused placeholder
+//     sender ID, not something read from the real touchscreen driver on
+//     your specific device. It has worked broadly in practice, but if
+//     injected touches don't land, try clearing it (senderID 0) first.
 //
-// Needs no special entitlements: private ivar access and a plain method
-// call are both available to any process acting on objects in its own
-// address space, jailbroken or not. -isAvailable is always YES.
+// A synthetic swipe is dispatched as three phases, a few ms apart:
+//   1. finger down at the start point   (touch=YES, range=YES)
+//   2. a handful of interpolated moves  (touch=YES, range=YES)
+//   3. finger up at the end point       (touch=NO,  range=NO)
 // =============================================================================
 
-@interface DirectTouchInjector : NSObject
+typedef double IOHIDFloat;
+typedef uint32_t IOOptionBits;   // real def is `typedef UInt32 IOOptionBits` in IOKit/IOTypes.h —
+                                 // declared by hand here because that header (via IOReturn.h /
+                                 // device_types.h) trips a Clang-modules-in-extern-C error on
+                                 // some SDK/toolchain combos. Same width, no header dependency.
+typedef struct __IOHIDEvent *IOHIDEventRef;
+typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+
+extern "C" {
+extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
+extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
+extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
+    CFAllocatorRef allocator, uint64_t timeStamp, uint32_t index, uint32_t identity,
+    uint32_t eventMask, IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
+    IOHIDFloat tipPressure, IOHIDFloat twist, Boolean range, Boolean touch, IOOptionBits options);
+extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+}
+
+static const uint32_t kIOHIDDigitizerEventRange    = 1 << 0;
+static const uint32_t kIOHIDDigitizerEventTouch    = 1 << 1;
+static const uint32_t kIOHIDDigitizerEventPosition = 1 << 2;
+static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
+
+@interface TouchInjector : NSObject
 + (instancetype)sharedInjector;
-@property (nonatomic, readonly) BOOL isAvailable;   // always YES — kept for call-site symmetry with the old injectors
+// YES iff IOHIDEventSystemClientCreate succeeded, i.e. injectSwipeFrom:to:duration:
+// can actually reach the HID system. NO on a non-jailbroken/sideloaded install
+// (see init below) -- callers should not report/flash success when this is NO.
+@property (nonatomic, readonly) BOOL isAvailable;
+// start/end are in points, in the same coordinate space as UIScreen.mainScreen.bounds.
 - (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
 @end
 
-@implementation DirectTouchInjector {
-    UITouch *_activeTouch;
-    // Bumped once per injectSwipeFrom:to:duration: call. Every scheduled
-    // step closure stamps in the generation it was created under and checks
-    // it before touching _activeTouch — a step from a swipe that's since
-    // been superseded by a newer one just no-ops instead of mutating the
-    // newer swipe's touch. Needed because the AI can fire a new swipe every
-    // ~0.15-0.3s, tighter than kSwipeDuration's own step spread, so overlap
-    // under any main-thread jitter is a real (not hypothetical) risk here —
-    // unlike the manual single-tap case this technique was validated against.
-    int64_t _swipeGeneration;
+@implementation TouchInjector {
+    IOHIDEventSystemClientRef _client;
 }
 
+- (BOOL)isAvailable { return _client != nil; }
+
 + (instancetype)sharedInjector {
-    static DirectTouchInjector *inst = nil;
+    static TouchInjector *inst = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [DirectTouchInjector new]; });
+    dispatch_once(&once, ^{ inst = [TouchInjector new]; });
     return inst;
 }
 
-- (BOOL)isAvailable { return YES; }
-
-// ---- ivar helpers ----
-
-- (void)writeScalarIvarOnObject:(id)object name:(const char *)name type:(const char *)type valuePtr:(void *)valuePtr {
-    Ivar ivar = class_getInstanceVariable([object class], name);
-    if (!ivar) return;
-    ptrdiff_t offset = ivar_getOffset(ivar);
-    void *ivarMemory = (uint8_t *)(__bridge void *)object + offset;
-    if (strcmp(type, @encode(CGPoint)) == 0) {
-        *(CGPoint *)ivarMemory = *(CGPoint *)valuePtr;
-    } else if (strcmp(type, @encode(UITouchPhase)) == 0) {
-        *(NSInteger *)ivarMemory = *(NSInteger *)valuePtr;
-    } else if (strcmp(type, @encode(NSTimeInterval)) == 0) {
-        *(NSTimeInterval *)ivarMemory = *(NSTimeInterval *)valuePtr;
-    } else if (strcmp(type, @encode(NSInteger)) == 0) {
-        *(NSInteger *)ivarMemory = *(NSInteger *)valuePtr;
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
+        if (!_client) os_log(AIPlayerLog(), "TouchInjector: IOHIDEventSystemClientCreate returned NULL "
+                            "(expected on a non-jailbroken device — injection will no-op)");
     }
+    return self;
 }
 
-- (CGPoint)readCGPointIvarOnObject:(id)object name:(const char *)name fallback:(CGPoint)fallback {
-    Ivar ivar = class_getInstanceVariable([object class], name);
-    if (!ivar) return fallback;
-    ptrdiff_t offset = ivar_getOffset(ivar);
-    void *ivarMemory = (uint8_t *)(__bridge void *)object + offset;
-    return *(CGPoint *)ivarMemory;
+- (void)sendFingerEventAtPoint:(CGPoint)p touch:(BOOL)touch range:(BOOL)range identity:(uint32_t)identity {
+    if (!_client) return;
+    uint32_t mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition;
+    IOHIDEventRef event = IOHIDEventCreateDigitizerFingerEvent(
+        kCFAllocatorDefault, mach_absolute_time(), 0, identity, mask,
+        p.x, p.y, 0, touch ? 1.0 : 0.0, 0, range, touch, 0);
+    if (!event) return;
+    IOHIDEventSetSenderID(event, kIOHIDDigitizerEventSenderID);
+    IOHIDEventSystemClientDispatchEvent(_client, event);
+    CFRelease(event);
 }
 
-- (void *)rawIvarPointerOnObject:(id)object name:(const char *)name {
-    Ivar ivar = class_getInstanceVariable([object class], name);
-    if (!ivar) return NULL;
-    ptrdiff_t offset = ivar_getOffset(ivar);
-    return (uint8_t *)(__bridge void *)object + offset;
+// Runs the down->move->up sequence on a background queue via usleep, so this
+// call returns immediately and never blocks the capture callback that
+// triggered it.
+- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
+    static uint32_t identityCounter = 1000;   // arbitrary range, kept away from real-finger identities
+    uint32_t identity = identityCounter++;
+    const NSInteger steps = 8;
+    const NSTimeInterval stepInterval = duration / steps;
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+        [self sendFingerEventAtPoint:start touch:YES range:YES identity:identity];
+        for (NSInteger i = 1; i <= steps; i++) {
+            usleep((useconds_t)(stepInterval * 1e6));
+            CGFloat t = (CGFloat)i / steps;
+            CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
+                                     start.y + (end.y - start.y) * t);
+            [self sendFingerEventAtPoint:p touch:YES range:YES identity:identity];
+        }
+        usleep((useconds_t)(stepInterval * 1e6));
+        [self sendFingerEventAtPoint:end touch:NO range:NO identity:identity];
+    });
 }
 
-- (void)defensiveSetObject:(id)value forProperty:(NSString *)propName onObject:(id)target {
-    NSString *ivarName = [NSString stringWithFormat:@"_%@", propName];
-    Ivar ivar = class_getInstanceVariable([target class], [ivarName UTF8String]);
-    if (ivar) {
-        object_setIvar(target, ivar, value);
+@end
+
+// =============================================================================
+// MARK: - In-process touch injection (KIF technique, works without jailbreak)
+//
+// TouchInjector above goes through IOHIDEventSystemClient, which requires a
+// SpringBoard-level HID entitlement a Sideloadly-injected, non-jailbroken
+// process cannot obtain (see TouchInjector's -init) -- that's an OS-enforced
+// entitlement/AMFI boundary, not something fixable by writing different code
+// while non-jailbroken.
+//
+// InProcessTouchInjector takes a different path entirely: it never asks the
+// OS to deliver anything system-wide. It reuses UIApplication's own
+// UITouchesEvent object (the same one UIKit's real touch pipeline uses),
+// attaches a hand-crafted IOHIDEventRef to it and to a synthetic UITouch via
+// private setters, and calls -[UIApplication sendEvent:] itself -- entirely
+// in-process, no privileged dispatch involved. This is the technique the KIF
+// iOS UI-testing framework (Apache-2.0, Copyright 2011-2016 Square, Inc.,
+// https://github.com/kif-framework/KIF) has shipped in production for over a
+// decade, including an explicit "iOS 26 compatibility fix" in v3.12.2
+// (https://github.com/kif-framework/KIF/releases) confirming the injection
+// mechanism itself -- as distinct from hit-testing coordinate resolution,
+// which is what that particular fix addressed -- is unchanged on iOS 26.
+// Adapted here from KIF's Sources/KIF/Additions/{UIView,UITouch,UIEvent,
+// UIApplication}-KIFAdditions.{h,m} and Sources/KIF/Classes/IOHIDEvent+KIF.
+// {h,m}, trimmed to just the down/move/up swipe path this needs (no
+// UIWebView/WKWebView special-casing, no multi-finger gestures, no XCTest
+// run-loop pumping).
+//
+// DEFENSIVE BY DESIGN: +isSupported probes every private selector via
+// respondsToSelector:/instancesRespondToSelector: before any of this is
+// ever invoked, and the actual injection sequence is wrapped in @try/@catch
+// as a second line of defense -- if some future iOS renames or removes one
+// of these, this logs clearly once and disables itself for the rest of the
+// session instead of crashing the host game process.
+// =============================================================================
+
+@interface AIOverlayWindow : UIWindow
+@end
+
+// ---- private selectors this relies on (all confirmed present as of KIF
+//      v3.12.3's source, the release with the explicit iOS 26 fix) ----
+
+@interface UIApplication (AIPlayerPrivateTouch)
+- (UIEvent *)_touchesEvent;
+// SPECULATIVE — selector name only confirmed present via method-list dump;
+// argument types below are a guess from the selector shape (touches set,
+// the event, and "touchable" -- presumably the target view/window), not a
+// verified signature. May be for Pencil-style estimated-touch updates
+// specifically rather than general touch registration -- semantics unknown.
+// Wrapped in a respondsToSelector: + NSInvocation-free direct call, and the
+// whole attempt is easy to strip if it doesn't pan out.
+- (void)_registerEstimatedTouches:(NSSet<UITouch *> *)touches event:(UIEvent *)event forTouchable:(id)touchable;
+@end
+
+@interface UIEvent (AIPlayerPrivateTouch)
+// -_clearTouches and -_addTouch:forDelayedDelivery: removed here -- confirmed
+// gone on iOS 26.5 via live method-list dump, not called anywhere anymore.
+- (void)_setHIDEvent:(IOHIDEventRef)event;
+@end
+
+@interface UITouch (AIPlayerPrivateTouch)
+- (void)setWindow:(UIWindow *)window;
+- (void)setView:(UIView *)view;
+- (void)setTapCount:(NSUInteger)tapCount;
+- (void)setPhase:(UITouchPhase)phase;
+- (void)setTimestamp:(NSTimeInterval)timestamp;
+- (void)setGestureView:(UIView *)view;
+- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)resetPrevious;
+- (void)_setIsFirstTouchForView:(BOOL)firstTouchForView;
+// NOTE: lowercase "id", different casing than UIEvent's _setHIDEvent: above.
+// Confirmed against KIF's actual current source -- not a typo.
+- (void)_setHidEvent:(IOHIDEventRef)event;
+@end
+
+// ---- low-level hand+finger IOHIDEvent construction, ported from KIF's
+//      IOHIDEvent+KIF.m (same file the "iOS 26 compatibility" release
+//      still ships unchanged) ----
+
+typedef struct { uint32_t hi; uint32_t lo; } AIPlayerAbsoluteTime;
+
+extern "C" {
+extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
+    CFAllocatorRef allocator, AIPlayerAbsoluteTime timeStamp, uint32_t transducerType,
+    uint32_t index, uint32_t identity, uint32_t eventMask, uint32_t buttonMask,
+    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat tipPressure, IOHIDFloat barrelPressure,
+    Boolean range, Boolean touch, IOOptionBits options);
+extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEventWithQuality(
+    CFAllocatorRef allocator, AIPlayerAbsoluteTime timeStamp, uint32_t index, uint32_t identity, uint32_t eventMask,
+    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat tipPressure, IOHIDFloat twist,
+    IOHIDFloat minorRadius, IOHIDFloat majorRadius, IOHIDFloat quality, IOHIDFloat density, IOHIDFloat irregularity,
+    Boolean range, Boolean touch, IOOptionBits options);
+extern void IOHIDEventAppendEvent(IOHIDEventRef event, IOHIDEventRef childEvent);
+extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, int value);
+}
+
+static const uint32_t kAIPlayerIOHIDDigitizerTransducerTypeHand = 3;   // kIOHIDDigitizerTransducerTypeHand
+static const uint32_t kAIPlayerIOHIDEventTypeDigitizer          = 11;  // kIOHIDEventTypeDigitizer
+static const uint32_t kAIPlayerIOHIDDigitizerEventRangeFlag     = 0x00000001;
+static const uint32_t kAIPlayerIOHIDDigitizerEventTouchFlag     = 0x00000002;
+static const uint32_t kAIPlayerIOHIDDigitizerEventPositionFlag  = 0x00000004;
+// kIOHIDEventFieldDigitizerIsDisplayIntegrated is the 26th (index 25) entry
+// of the digitizer field enum in KIF's IOHIDEvent+KIF.m -- vendored as a
+// named constant rather than re-deriving the index by hand to avoid an
+// off-by-one.
+static const uint32_t kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated =
+    (kAIPlayerIOHIDEventTypeDigitizer << 16) + 25;
+
+static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
+    uint64_t abTime = mach_absolute_time();
+    AIPlayerAbsoluteTime timeStamp = { (uint32_t)(abTime >> 32), (uint32_t)abTime };
+
+    IOHIDEventRef handEvent = IOHIDEventCreateDigitizerEvent(
+        kCFAllocatorDefault, timeStamp, kAIPlayerIOHIDDigitizerTransducerTypeHand,
+        0, 0, kAIPlayerIOHIDDigitizerEventTouchFlag, 0,
+        0, 0, 0, 0, 0, 0, true, 0);
+    if (!handEvent) {
+        // TEMP DIAGNOSTIC — if this fires, IOHIDEventCreateDigitizerEvent
+        // itself is failing (likely a sandbox/entitlement rejection under
+        // Sideloadly injection), not a downstream dispatch problem. Every
+        // touch built from this point on has no real HID backing.
+        static CFTimeInterval lastLog = 0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastLog > 2.0) {
+            lastLog = now;
+            os_log(AIPlayerLog(), "[DIAG] IOHIDEventCreateDigitizerEvent returned NULL — "
+                  "hand event construction failed, no HID event will be attached");
+        }
+        return NULL;
+    }
+    IOHIDEventSetIntegerValue(handEvent, kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+
+    NSUInteger idx = 0;
+    for (UITouch *touch in touches) {
+        uint32_t eventMask = (touch.phase == UITouchPhaseMoved)
+            ? kAIPlayerIOHIDDigitizerEventPositionFlag
+            : (kAIPlayerIOHIDDigitizerEventRangeFlag | kAIPlayerIOHIDDigitizerEventTouchFlag);
+        BOOL isTouching = (touch.phase != UITouchPhaseEnded);
+        CGPoint p = [touch locationInView:touch.window];
+
+        IOHIDEventRef fingerEvent = IOHIDEventCreateDigitizerFingerEventWithQuality(
+            kCFAllocatorDefault, timeStamp, (uint32_t)(idx + 1), 2, eventMask,
+            p.x, p.y, 0, 0, 0, 5.0, 5.0, 1.0, 1.0, 1.0,
+            isTouching, isTouching, 0);
+        idx++;
+        if (!fingerEvent) continue;
+        IOHIDEventSetIntegerValue(fingerEvent, kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
+        IOHIDEventAppendEvent(handEvent, fingerEvent);
+        CFRelease(fingerEvent);
+    }
+    return handEvent;
+}
+
+@interface InProcessTouchInjector : NSObject
++ (instancetype)sharedInjector;
++ (BOOL)isSupported;   // caches the capability probe; re-checks failure state each call
+@property (nonatomic, readonly) BOOL hasFailedThisSession;
+// start/end are in the target window's coordinate space (see -targetWindow;
+// for a full-screen game window this is the same as UIScreen.mainScreen.bounds).
+- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
+@end
+
+@implementation InProcessTouchInjector {
+    BOOL _disabledAfterFailure;
+}
+
+- (BOOL)hasFailedThisSession { return _disabledAfterFailure; }
+
++ (instancetype)sharedInjector {
+    static InProcessTouchInjector *inst = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ inst = [InProcessTouchInjector new]; });
+    return inst;
+}
+
++ (BOOL)isSupported {
+    static BOOL supported = NO;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        UIApplication *app = [UIApplication sharedApplication];
+        NSMutableArray<NSString *> *missing = [NSMutableArray array];
+
+        // NOTE: -[UIEvent _clearTouches] and -[UIEvent _addTouch:forDelayedDelivery:]
+        // were dropped from this gate. Confirmed via a live class_copyMethodList
+        // dump on-device (iOS 26.5): UIEvent's touch-mutation API is gone
+        // entirely -- no renamed equivalent exists, superclass chain is just
+        // UIEvent -> NSObject so it didn't move to a base class either.
+        // dispatchTouch:phase: below no longer calls either selector; it
+        // mutates the UITouch directly and re-fetches/sends the app's
+        // -_touchesEvent instead. Everything still checked here (below) was
+        // confirmed PRESENT in that same dump.
+        if (![app respondsToSelector:@selector(_touchesEvent)]) [missing addObject:@"-[UIApplication _touchesEvent]"];
+        if (![UIEvent instancesRespondToSelector:@selector(_setHIDEvent:)]) [missing addObject:@"-[UIEvent _setHIDEvent:]"];
+        if (![UITouch instancesRespondToSelector:@selector(_setLocationInWindow:resetPrevious:)]) [missing addObject:@"-[UITouch _setLocationInWindow:resetPrevious:]"];
+        if (![UITouch instancesRespondToSelector:@selector(_setHidEvent:)]) [missing addObject:@"-[UITouch _setHidEvent:]"];
+        if (![UITouch instancesRespondToSelector:@selector(setPhase:)]) [missing addObject:@"-[UITouch setPhase:]"];
+        if (![UITouch instancesRespondToSelector:@selector(setWindow:)]) [missing addObject:@"-[UITouch setWindow:]"];
+
+        if (missing.count > 0) {
+            os_log(AIPlayerLog(), "InProcessTouchInjector: unsupported on this iOS build, missing: %{public}@",
+                  [missing componentsJoinedByString:@", "]);
+            supported = NO;
+        } else {
+            UIEvent *probe = [app _touchesEvent];
+            supported = (probe != nil);
+            if (!supported) os_log(AIPlayerLog(), "InProcessTouchInjector: -[UIApplication _touchesEvent] returned nil");
+        }
+    });
+    return supported && !([InProcessTouchInjector sharedInjector].hasFailedThisSession);
+}
+
+- (nullable UIWindow *)targetWindow {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *fallback = nil;
+
+    NSMutableArray<UIWindow *> *candidateWindows = [NSMutableArray array];
+    for (UIScene *scene in app.connectedScenes) {
+        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *windowScene = (UIWindowScene *)scene;
+        [candidateWindows addObjectsFromArray:windowScene.windows];
     }
 
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-    id readBack = [target performSelector:NSSelectorFromString(propName)];
-    if (readBack == value) {
-        return;
+    for (UIWindow *w in candidateWindows) {
+        if ([w isKindOfClass:[AIOverlayWindow class]]) continue;   // that's our own toggle-button window, not the game
+        if (w.isKeyWindow) return w;
+        if (!fallback) fallback = w;
+    }
+    return fallback;
+}
+
+- (UITouch *)touchAtPoint:(CGPoint)windowPoint inWindow:(UIWindow *)window {
+    UITouch *touch = [UITouch new];
+    [touch setWindow:window];
+    [touch setTapCount:1];
+    [touch _setLocationInWindow:windowPoint resetPrevious:YES];
+
+    UIView *hit = [window hitTest:windowPoint withEvent:nil];
+    [touch setView:hit];
+    [touch setPhase:UITouchPhaseBegan];
+    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) {
+        [touch _setIsFirstTouchForView:YES];
+    }
+    [touch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
+    if ([touch respondsToSelector:@selector(setGestureView:)]) {
+        [touch setGestureView:hit];
     }
 
-    NSString *publicSelectorString = [NSString stringWithFormat:@"set%@:", [propName capitalizedString]];
-    SEL publicSelector = NSSelectorFromString(publicSelectorString);
-    if ([target respondsToSelector:publicSelector]) {
-        [target performSelector:publicSelector withObject:value];
-        if ([target performSelector:NSSelectorFromString(propName)] == value) {
-            return;
+    IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
+    if (hidEvent) {
+        [touch _setHidEvent:hidEvent];
+        CFRelease(hidEvent);
+    }
+    return touch;
+}
+
+- (void)dispatchTouch:(UITouch *)touch phase:(UITouchPhase)phase {
+    [touch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
+    [touch setPhase:phase];
+
+    // iOS 26.5 CHANGE: -[UIEvent _clearTouches] and
+    // -[UIEvent _addTouch:forDelayedDelivery:] no longer exist (confirmed via
+    // live method-list dump -- not renamed, just gone; UIEvent's superclass
+    // chain is plain UIEvent -> NSObject, so it didn't move to a base class
+    // either). UIEvent's touch set is no longer externally mutable on this
+    // build. -[UIEvent _setHIDEvent:] is still present, so the working
+    // hypothesis is that UIKit now derives an event's touches from the HID
+    // event's digitizer payload internally, rather than from explicit
+    // _addTouch: calls -- which is also consistent with _setHidEvent: still
+    // being present and settable on UITouch itself.
+    IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
+    if (phase == UITouchPhaseBegan) {
+        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: hidEvent=%{public}s",
+              hidEvent ? "attached" : "NULL (no HID backing)");
+    }
+    if (hidEvent) {
+        [touch _setHidEvent:hidEvent];
+    }
+
+    UIApplication *app = [UIApplication sharedApplication];
+    UIEvent *event = [app _touchesEvent];
+    if (hidEvent) {
+        [event _setHIDEvent:hidEvent];
+    }
+    if (hidEvent) CFRelease(hidEvent);
+
+    // RESULT of the previous attempt: event.allTouches.count was 0 on nearly
+    // every swipe -- attaching the HID event alone does NOT make UIKit
+    // auto-populate the touch set. That hypothesis is disproven.
+    //
+    // NEXT ATTEMPT (speculative) -- try -[UIApplication
+    // _registerEstimatedTouches:event:forTouchable:]. Selector name only, no
+    // confirmed signature or semantics; may be Pencil-specific. Guarded by
+    // respondsToSelector: so a mismatched signature just no-ops instead of
+    // crashing if the real signature differs from our guess.
+    if (phase == UITouchPhaseBegan &&
+        [app respondsToSelector:@selector(_registerEstimatedTouches:event:forTouchable:)]) {
+        UIView *touchable = touch.view ?: (id)[self targetWindow];
+        @try {
+            [app _registerEstimatedTouches:[NSSet setWithObject:touch] event:event forTouchable:touchable];
+            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: called, no exception");
+        } @catch (NSException *ex) {
+            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: threw: %{public}@ %{public}@",
+                  ex.name, ex.reason);
         }
     }
-    #pragma clang diagnostic pop
 
-    [target setValue:value forKey:propName];
+    // TEMP DIAGNOSTIC — allTouches.count AFTER the registration attempt
+    // above, so we can tell whether it changed anything.
+    if (phase == UITouchPhaseBegan) {
+        NSSet *all = [event respondsToSelector:@selector(allTouches)] ? [event allTouches] : nil;
+        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: event.allTouches.count=%lu (post-register attempt)",
+              (unsigned long)all.count);
+    }
+
+    [app sendEvent:event];
 }
 
-// Mirrors GG_KeyWindow() from the validated GrayHueCapture tweak, plus an
-// explicit skip of our own overlay window (which can never become key
-// anyway, since AIOverlayWindow overrides -canBecomeKeyWindow to return NO
-// — this check is just an extra safety net, not load-bearing).
-- (nullable UIWindow *)keyWindow {
-    if (@available(iOS 13.0, *)) {
-        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
-            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
-            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *window in ((UIWindowScene *)scene).windows) {
-                if ([window isKindOfClass:[AIOverlayWindow class]]) continue;
-                if (window.isKeyWindow) return window;
-            }
-        }
-    }
-    #pragma clang diagnostic push
-    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return [UIApplication sharedApplication].keyWindow;
-    #pragma clang diagnostic pop
-}
-
-// Core per-event dispatcher — ports HybridTouchSynthesizer's validated
-// approach, minus the sendEvent:/GSEventProxy path entirely (confirmed
-// unnecessary; direct dispatch alone is what reached UnityView on-device).
-- (void)dispatchTouchAtPoint:(CGPoint)point phase:(UITouchPhase)phase inOutTouch:(UITouch **)activeTouch {
-    UIWindow *keyWindow = [self keyWindow];
-    if (!keyWindow) {
-        os_log(AIPlayerLog(), "[DIAG][Touch] dispatchTouchAtPoint aborted — no keyWindow found");
-        return;
-    }
-
-    UITouch *touch = *activeTouch;
-    BOOL isNewTouch = (!touch || phase == UITouchPhaseBegan);
-
-    if (isNewTouch) {
-        touch = [[UITouch alloc] init];
-        *activeTouch = touch;
-
-        UIView *targetView = [keyWindow hitTest:point withEvent:nil];
-        if (!targetView) targetView = keyWindow;
-        os_log(AIPlayerLog(), "[DIAG][Touch] new touch — hitTest at (%.1f, %.1f) -> %{public}@",
-              point.x, point.y, NSStringFromClass([targetView class]));
-
-        [self defensiveSetObject:keyWindow forProperty:@"window" onObject:touch];
-        [self defensiveSetObject:targetView forProperty:@"view" onObject:touch];
-
-        NSInteger tapCount = 1;
-        [self writeScalarIvarOnObject:touch name:"_tapCount" type:@encode(NSInteger) valuePtr:&tapCount];
-        uint16_t *touchFlagsPtr = (uint16_t *)[self rawIvarPointerOnObject:touch name:"_touchFlags"];
-        if (touchFlagsPtr) *touchFlagsPtr |= 0x3;
-    }
-
-    CGPoint previousPoint = isNewTouch
-        ? point
-        : [self readCGPointIvarOnObject:touch name:"_locationInWindow" fallback:point];
-
-    if (!isNewTouch) {
-        CGFloat dx = point.x - previousPoint.x;
-        CGFloat dy = point.y - previousPoint.y;
-        if (fabs(dx) > 2.0 || fabs(dy) > 2.0) {
-            uint16_t *touchFlagsPtr = (uint16_t *)[self rawIvarPointerOnObject:touch name:"_touchFlags"];
-            if (touchFlagsPtr) *touchFlagsPtr &= 0xFFFD;
-        }
-    }
-
-    NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
-    [self writeScalarIvarOnObject:touch name:"_locationInWindow" type:@encode(CGPoint) valuePtr:&point];
-    [self writeScalarIvarOnObject:touch name:"_previousLocationInWindow" type:@encode(CGPoint) valuePtr:&previousPoint];
-    [self writeScalarIvarOnObject:touch name:"_phase" type:@encode(UITouchPhase) valuePtr:&phase];
-    [self writeScalarIvarOnObject:touch name:"_timestamp" type:@encode(NSTimeInterval) valuePtr:&timestamp];
-
-    // Confirmed on-device: direct dispatch with event:nil works fine — the
-    // hit-tested view's touchesXXX override never inspects the event
-    // object, only the touch's own properties. No sendEvent:, ever.
-    UIView *targetView = touch.view;
-    NSSet *touchesSet = [NSSet setWithObject:touch];
-    if (targetView) {
-        switch (phase) {
-            case UITouchPhaseBegan:
-                if ([targetView respondsToSelector:@selector(touchesBegan:withEvent:)]) {
-                    [targetView touchesBegan:touchesSet withEvent:nil];
-                } else {
-                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesBegan:withEvent:", NSStringFromClass([targetView class]));
-                }
-                break;
-            case UITouchPhaseMoved:
-                if ([targetView respondsToSelector:@selector(touchesMoved:withEvent:)]) {
-                    [targetView touchesMoved:touchesSet withEvent:nil];
-                } else {
-                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesMoved:withEvent:", NSStringFromClass([targetView class]));
-                }
-                break;
-            case UITouchPhaseStationary:
-                break;
-            case UITouchPhaseEnded:
-                if ([targetView respondsToSelector:@selector(touchesEnded:withEvent:)]) {
-                    [targetView touchesEnded:touchesSet withEvent:nil];
-                } else {
-                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesEnded:withEvent:", NSStringFromClass([targetView class]));
-                }
-                break;
-            case UITouchPhaseCancelled:
-            default:
-                if ([targetView respondsToSelector:@selector(touchesCancelled:withEvent:)]) {
-                    [targetView touchesCancelled:touchesSet withEvent:nil];
-                } else {
-                    os_log(AIPlayerLog(), "[DIAG][Touch] %{public}@ does not respond to touchesCancelled:withEvent:", NSStringFromClass([targetView class]));
-                }
-                break;
-        }
-    } else {
-        os_log(AIPlayerLog(), "[DIAG][Touch] phase=%ld dispatched nothing — touch.view is nil", (long)phase);
-    }
-
-    if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) {
-        *activeTouch = nil;
-    }
-}
-
-// Runs entirely on the main thread (UIKit touch delivery requires it), but
-// this call itself returns immediately — the down/move/up steps are
+// Runs entirely on the main thread (UIKit event delivery requires it), but
+// this call itself returns immediately -- the down/move/up steps are
 // scheduled via dispatch_after on the main queue so the capture callback
 // that triggered this is never blocked.
 - (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
+    if (_disabledAfterFailure || ![InProcessTouchInjector isSupported]) return;
+
     dispatch_async(dispatch_get_main_queue(), ^{
-        int64_t myGeneration = ++self->_swipeGeneration;
+        @try {
+            UIWindow *window = [self targetWindow];
+            if (!window) {
+                os_log(AIPlayerLog(), "InProcessTouchInjector: no target window found");
+                return;
+            }
 
-        // If a previous swipe is still mid-flight, finalize it immediately.
-        // Its own remaining step closures are now stale and will no-op
-        // below via the generation check, instead of mutating the touch
-        // this new swipe is about to create.
-        if (self->_activeTouch) {
-            UITouch *temp = self->_activeTouch;
-            CGPoint lastPoint = [self readCGPointIvarOnObject:temp name:"_locationInWindow" fallback:start];
-            [self dispatchTouchAtPoint:lastPoint phase:UITouchPhaseCancelled inOutTouch:&temp];
-            self->_activeTouch = temp;
-        }
-
-        const NSInteger steps = 8;
-        NSTimeInterval stepInterval = duration / steps;
-
-        UITouch *touch = self->_activeTouch;
-        [self dispatchTouchAtPoint:start phase:UITouchPhaseBegan inOutTouch:&touch];
-        self->_activeTouch = touch;
-
-        for (NSInteger i = 1; i <= steps; i++) {
-            int64_t delayNanos = (int64_t)(stepInterval * i * NSEC_PER_SEC);
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanos), dispatch_get_main_queue(), ^{
-                // A newer swipe has since taken over _activeTouch — this
-                // step belongs to a superseded sequence. Do nothing rather
-                // than corrupt the newer touch with this swipe's coordinates.
-                if (myGeneration != self->_swipeGeneration) return;
-
+            const NSInteger steps = 8;
+            NSMutableArray<NSValue *> *points = [NSMutableArray arrayWithCapacity:steps + 1];
+            for (NSInteger i = 0; i <= steps; i++) {
                 CGFloat t = (CGFloat)i / steps;
                 CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
                                          start.y + (end.y - start.y) * t);
-                UITouch *stepTouch = self->_activeTouch;
-                [self dispatchTouchAtPoint:p
-                                      phase:(i == steps ? UITouchPhaseEnded : UITouchPhaseMoved)
-                                 inOutTouch:&stepTouch];
-                self->_activeTouch = stepTouch;
-            });
+                [points addObject:[NSValue valueWithCGPoint:p]];
+            }
+
+            UITouch *touch = [self touchAtPoint:points[0].CGPointValue inWindow:window];
+            [self dispatchTouch:touch phase:UITouchPhaseBegan];
+
+            NSTimeInterval stepInterval = duration / steps;
+            for (NSInteger i = 1; i <= steps; i++) {
+                int64_t delayNanos = (int64_t)(stepInterval * i * NSEC_PER_SEC);
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanos), dispatch_get_main_queue(), ^{
+                    @try {
+                        [touch _setLocationInWindow:points[i].CGPointValue resetPrevious:NO];
+                        [self dispatchTouch:touch phase:(i == steps ? UITouchPhaseEnded : UITouchPhaseMoved)];
+                    } @catch (NSException *ex) {
+                        [self handleFailure:ex];
+                    }
+                });
+            }
+        } @catch (NSException *ex) {
+            [self handleFailure:ex];
         }
     });
+}
+
+- (void)handleFailure:(NSException *)ex {
+    _disabledAfterFailure = YES;
+    os_log(AIPlayerLog(), "InProcessTouchInjector: %{public}@ (%{public}@) -- one of the private selectors this "
+          "relies on didn't behave as expected on this iOS build. Disabling in-process "
+          "injection for the rest of this session; TouchInjector (system HID) remains as "
+          "the fallback path, though it will itself no-op without a jailbreak.",
+          ex.name, ex.reason);
 }
 
 @end
@@ -1038,9 +1304,39 @@ static NSURL *AIPlayerModelURL(void) {
     }
 
     // center/end are computed from the screen bounds; for a normal full-
-    // screen game window this is the same coordinate space DirectTouchInjector
+    // screen game window this is the same coordinate space InProcessTouchInjector
     // expects (window.bounds), so no conversion is needed here.
-    [[DirectTouchInjector sharedInjector] injectSwipeFrom:center to:end duration:kSwipeDuration];
+    if ([InProcessTouchInjector isSupported]) {
+        [[InProcessTouchInjector sharedInjector] injectSwipeFrom:center to:end duration:kSwipeDuration];
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf flashInjectionFeedback]; });
+        return;
+    }
+
+    // Fall back to the system-HID path -- only actually delivers on a
+    // jailbroken device (see TouchInjector's -init), but kept as a fallback
+    // in case InProcessTouchInjector ever disables itself mid-session.
+    TouchInjector *injector = [TouchInjector sharedInjector];
+    if (!injector.isAvailable) {
+        // Don't flash gold here -- that would falsely claim the swipe landed.
+        // See TouchInjector's init: on a non-jailbroken/Sideloadly-injected
+        // install, IOHIDEventSystemClientCreate returns NULL and every
+        // injected touch below this point is silently dropped by design.
+        // The detection/direction pipeline is working correctly (that's why
+        // we got this far) -- this is strictly a "can't reach the HID
+        // system from here" limitation, not a model or preprocessing bug.
+        static CFTimeInterval lastUnavailableLog = 0;
+        CFTimeInterval now = CACurrentMediaTime();
+        if (now - lastUnavailableLog > 5.0) {
+            lastUnavailableLog = now;
+            os_log(AIPlayerLog(), "swipe dir=%ld conf=%.2f det=%.2f — model fired correctly but "
+                  "neither InProcessTouchInjector nor TouchInjector can deliver on this "
+                  "install; swipe NOT delivered", (long)dir, conf, det);
+        }
+        return;
+    }
+
+    [injector injectSwipeFrom:center to:end duration:kSwipeDuration];
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf flashInjectionFeedback]; });
@@ -1063,6 +1359,66 @@ static NSURL *AIPlayerModelURL(void) {
 
 @end
 
+// =============================================================================
+// MARK: - Runtime introspection dump (diagnostic-only)
+//
+// InProcessTouchInjector's +isSupported logged that -[UIEvent _clearTouches]
+// and -[UIEvent _addTouch:forDelayedDelivery:] are gone on this iOS build.
+// Rather than guess at replacement names, dump every instance method UIEvent,
+// UITouch, and UIApplication actually respond to on THIS device/iOS version
+// right now, so the real current selector names can be read straight out of
+// the Console log instead of inferred from a KIF version that may predate
+// this iOS release.
+//
+// Runs once, ~200ms after launch (after the swizzle/class-loading dust
+// settles), and only logs -- doesn't touch any injection behavior. Safe to
+// leave in during this investigation phase; strip it once the replacement
+// selectors are found and wired in.
+// =============================================================================
+
+static void AIPlayerDumpMethods(Class cls, NSString *label) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    if (!methods) {
+        os_log(AIPlayerLog(), "[DIAG] %{public}@: class_copyMethodList returned NULL", label);
+        return;
+    }
+    NSMutableArray<NSString *> *names = [NSMutableArray arrayWithCapacity:count];
+    for (unsigned int i = 0; i < count; i++) {
+        [names addObject:NSStringFromSelector(method_getName(methods[i]))];
+    }
+    free(methods);
+    [names sortUsingSelector:@selector(compare:)];
+    os_log(AIPlayerLog(), "[DIAG] %{public}@ (%u methods):", label, count);
+    for (NSString *n in names) {
+        os_log(AIPlayerLog(), "[DIAG]   %{public}@ %{public}@", label, n);
+    }
+}
+
+static void AIPlayerDumpTouchAPISurface(void) {
+    // Instance methods only (class_copyMethodList on the class object itself
+    // would give class/+ methods -- +load, +new, etc. -- which aren't what
+    // we're after here; the private touch-delivery API is all -instance).
+    AIPlayerDumpMethods(object_getClass([UIEvent class]) ? [UIEvent class] : Nil, @"UIEvent");
+    AIPlayerDumpMethods([UITouch class], @"UITouch");
+    AIPlayerDumpMethods([UIApplication class], @"UIApplication");
+
+    // Also walk UIEvent's superclass chain -- if touch-set mutation moved to
+    // a new internal base class (e.g. some private _UIInternalEvent) rather
+    // than staying on UIEvent itself, a plain class dump above would miss it
+    // entirely, so log the chain to know whether that's worth checking too.
+    Class c = [UIEvent class];
+    NSMutableArray<NSString *> *chain = [NSMutableArray array];
+    while (c) {
+        [chain addObject:NSStringFromClass(c)];
+        c = class_getSuperclass(c);
+    }
+    os_log(AIPlayerLog(), "[DIAG] UIEvent superclass chain: %{public}@",
+          [chain componentsJoinedByString:@" -> "]);
+}
+
+
+
 __attribute__((constructor))
 static void AIPlayerInit(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
@@ -1077,5 +1433,14 @@ static void AIPlayerInit(void) {
         win.backgroundColor = [UIColor clearColor];
         win.rootViewController = [AIOverlayVC new];
         win.hidden = NO;
+    });
+
+    // TEMP DIAGNOSTIC — one-shot dump of the real UIEvent/UITouch/
+    // UIApplication method surface on this device's actual iOS build.
+    // 200ms delay: give UIKit's own class loading/swizzling time to settle
+    // before enumerating, so the dump reflects final runtime state.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        AIPlayerDumpTouchAPISurface();
     });
 }
