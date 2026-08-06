@@ -3,17 +3,25 @@
 //
 // Shows a small floating "AI: OFF / AI: ON" button. Tapping it starts/stops
 // a screen-capture + Core ML inference loop. Every high-confidence detection
-// is logged AND injected into the game as a synthesized swipe (see
-// TouchInjector below) — the button flashes gold for ~150ms each time a
-// swipe is actually sent, so you can visually confirm firing rate.
+// is logged AND injected into the game as a synthesized swipe via
+// HybridTouchSynthesizer (see the "Touch synthesis engine" MARK block below)
+// — the button flashes gold for ~150ms each time a swipe is actually sent,
+// so you can visually confirm firing rate.
 //
-// TouchInjector uses undocumented IOHIDEvent digitizer APIs (the standard
-// jailbreak-tweak technique for synthetic touch input — see the class
-// comment for details and caveats). It only works on a jailbroken device
-// with SpringBoard-level HID access; it will silently no-op on stock iOS.
-// Validate against on-screen gameplay with AI: ON before trusting it in a
-// real run — these are private APIs with no stability guarantee across
-// iOS versions.
+// HybridTouchSynthesizer is ported verbatim from RandomSwipeTweak.xm: it
+// builds a synthetic UITouch + GSEventProxy-backed UIEvent by hand (Layer B,
+// via the private _initWithEvent:touches: initializer) and sends it, then
+// unconditionally also dispatches touchesBegan/Moved/Ended/Cancelled:withEvent:
+// directly on the hit-tested view (Layer A) — this replaces two earlier
+// approaches that didn't work on this device/iOS build: TouchInjector
+// (system-HID via IOHIDEventSystemClient, requires jailbreak-level
+// SpringBoard access this Sideloadly-injected process doesn't have) and
+// InProcessTouchInjector (a KIF-style sendEvent:-only approach confirmed via
+// on-device logging to leave event.allTouches.count==0 on every dispatch).
+// These are still undocumented private APIs with no stability guarantee
+// across iOS versions — validate against on-screen gameplay with AI: ON
+// before trusting it in a real run, and watch Console.app for the
+// UnityDiagnostics [Diag] hook confirming touches actually reach UnityView.
 //
 // PREPROCESSING CONTRACT — must exactly match build_dataset_v3_gpu.py:
 //   1. Resize to (kImgSize, kImgSize) via SQUARE STRETCH (not
@@ -370,495 +378,1275 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 @end
 
 // =============================================================================
-// MARK: - TouchInjector — synthesizes swipes via IOHIDEvent digitizer events
+// MARK: - Touch synthesis engine — ported VERBATIM from RandomSwipeTweak.xm
 //
-// This is the standard technique used across jailbreak-tweak touch-simulation
-// tools (e.g. STHIDEventGenerator-style utilities): build IOHIDEvent
-// "digitizer finger" events by hand and dispatch them straight into the HID
-// event system, the same path a real finger's events travel. There is no
-// public API for this — the declarations below are reconstructed from
-// widely-circulated reverse-engineering references, not an Apple header.
+// Replaces the old TouchInjector (system-HID, requires jailbreak, never
+// worked here) and InProcessTouchInjector (KIF-style sendEvent:, confirmed
+// via on-device Console.app logging to leave event.allTouches.count==0 on
+// this device/iOS build -- see conversation history). Every method below is
+// copied unedited from RandomSwipeTweak.xm, including its own changelog
+// comment (kept intact since it documents exactly how confident each
+// reconstructed private-API behavior is). The only changes anywhere in this
+// block are: (1) this MARK header itself, and (2) the four #import lines at
+// the top of the original file were dropped since AIPlayer.xm's own header
+// already imports UIKit/UIKit.h, objc/runtime.h, os/log.h, and math.h.
 //
-// Caveats (read before relying on this):
-//   • Undocumented/private. Field names, bit values, and behavior can change
-//     between iOS versions with no notice and no deprecation warning.
-//   • Requires SpringBoard-level HID access, which a system-injected dylib
-//     on a jailbroken device has — this will silently do nothing on stock
-//     iOS or in a sandboxed app.
-//   • kIOHIDDigitizerEventSenderID below is a commonly-reused placeholder
-//     sender ID, not something read from the real touchscreen driver on
-//     your specific device. It has worked broadly in practice, but if
-//     injected touches don't land, try clearing it (senderID 0) first.
+// -injectSwipeForDirection:confidence:detection: (further down this file)
+// now drives a swipe by calling FloatingSwipeButtonManager's own, unedited
+// -executeSingleShotSwipeFrom:to:duration: with the model's predicted
+// start/end points instead of -triggerSwipe's random direction -- it does
+// not reimplement any dispatch logic itself.
 //
-// A synthetic swipe is dispatched as three phases, a few ms apart:
-//   1. finger down at the start point   (touch=YES, range=YES)
-//   2. a handful of interpolated moves  (touch=YES, range=YES)
-//   3. finger up at the end point       (touch=NO,  range=NO)
+// NOTE: this ports RandomSwipeTweak.xm's OWN overlay button too
+// (FloatingSwipeButtonManager -showOverlayButton, wired to fire on
+// -[UIWindow makeKeyAndVisible] below) -- a second, separate red "Swipe"
+// button will appear on screen alongside AIPlayer's existing AI ON/OFF
+// button, and tapping it fires an independent random-direction demo swipe
+// through this same engine. Left in because it's a real method in the
+// source file and the instruction was every method, no edits -- remove the
+// %hook UIWindow block below if you don't want that second button.
 // =============================================================================
 
-typedef double IOHIDFloat;
-typedef uint32_t IOOptionBits;   // real def is `typedef UInt32 IOOptionBits` in IOKit/IOTypes.h —
-                                 // declared by hand here because that header (via IOReturn.h /
-                                 // device_types.h) trips a Clang-modules-in-extern-C error on
-                                 // some SDK/toolchain combos. Same width, no header dependency.
-typedef struct __IOHIDEvent *IOHIDEventRef;
-typedef struct __IOHIDEventSystemClient *IOHIDEventSystemClientRef;
+// ===========================================================
+// CHANGELOG — see Tweak_xm_factcheck.md for the first-pass evidence.
+//
+// SEVENTH PASS (this revision, Tweak_5.xm) — EMPIRICAL, not ground-truth-
+// derived. On-device Console.app logging (see the UnityDiagnostics [Diag]
+// hook further down) proved sendEvent:-based delivery (Layer B) is not
+// reaching -[UnityView touches...:withEvent:] on this device/iOS build at
+// all, even though event construction always succeeds (syntheticEvent
+// built OK every time, no nil, no exception — sendEvent: just silently
+// drops it). Real finger touches fire [Diag] lines immediately; the exact
+// same synthetic phase sequence, sent via sendSyntheticEvent:toWindow:,
+// produced none. Fix #18: -performEventCreationFailureFallbackForTouch:
+// (Layer A — direct touchesBegan/Moved/Ended:withEvent: calls on
+// touch.view) is now called UNCONDITIONALLY in
+// -dispatchHybridTouchAtPoint:phase:inOutTouch:, not just when event
+// creation returns nil as originally gated. See the inline comment at the
+// call site for the known double-delivery risk on other devices/builds.
+//
+// SIXTH PASS (Tweak_4.xm): cross-checked directly against the
+// actual ground-truth SOURCE (iGameGod.c's decompiled
+// __UIEvent_Synthesize__initWithTouch__), not just prior disassembly/notes.
+// Two real findings:
+// 16. Fix #13 (flags mapping) was WRONG as of the fifth pass. Ground truth,
+//     read directly from __UIEvent_Synthesize__initWithTouch__:
+//         uVar9 = 0x1010180;                  // default
+//         if (phase != Ended(3)) {
+//             if (phase != Cancelled(4)) {
+//                 uVar9 = 0x3010180;           // override
+//             }
+//         }
+//     i.e. Began(0)/Moved(1)/Stationary(2) get overridden to 0x3010180, and
+//     Ended(3)/Cancelled(4) BOTH keep the default 0x1010180. The fifth pass
+//     had this backwards (default-for-everything-except-Cancelled), which
+//     silently re-broke a bug this project had already found and fixed once
+//     empirically on the first working attempt (see project notes: "Began/
+//     Moved/Stationary should get flags 0x3010180, Ended/Cancelled should
+//     get 0x1010180"). Reverted to match the actual binary.
+// 17. buildSyntheticEventForTouch: never set the constructed EVENT object's
+//     own _timestamp ivar — only the touch's. Ground truth explicitly reads
+//     back into the just-created event's _timestamp field immediately after
+//     _initWithEvent:touches: returns non-nil, before returning it to the
+//     caller. Added below.
+//
+// THIRD VERIFICATION PASS (earlier revision) independently re-derived every
+// claim below directly from iGameGod.c rather than trusting the first-pass
+// document, and found the document's own headline claims on #1/#2/#8 were
+// wrong or overconfident. Corrected here; see inline comments at each call
+// site for the exact line-level evidence.
+//
+// FIFTH PASS (Tweak_3.xm): raw disassembly of
+// -[UIEvent(Synthesize) _initWithTouch:] and FUN_00584b84/FUN_0058eb90/
+// FUN_00587624/FUN_0057efe4 confirmed everything in items #1/#8 above was
+// actually correct as stated (the earlier "raw disassembly" citations were
+// unverifiable at the time they were written, but turned out accurate).
+// NOTE: this pass's own item #13 (flags) turned out to be wrong — see
+// SIXTH PASS item #16 above, which supersedes it.
+// Also confirmed and left unchanged: FUN_00587624's action-code table
+// (actionCodeForTouch:, further down) matches the binary's
+// FUN_0057efe4 exactly, bit for bit, across all six input booleans and
+// all five return values — no changes needed there.
+//
+// BUILD FIXES (Xcode 26.6 / iOS 26.5 SDK, -Werror): these are toolchain/
+// ARC issues, not ground-truth discrepancies — nothing here changes
+// runtime behavior versus the binary.
+// 14. [UIApplication sharedApplication].keyWindow is deprecated (iOS 13+,
+//     ignores multi-scene apps). Replaced all three call sites with
+//     GG_KeyWindow(), which walks connectedScenes for the foreground-
+//     active UIWindowScene's key window and only falls back to the
+//     deprecated accessor if that comes up empty.
+// 15. Passing &_currentPersistentTouch (an ivar) directly to a
+//     UITouch ** / __autoreleasing out-param doesn't compile under ARC
+//     ("passing address of non-local object to __autoreleasing parameter
+//     for write-back"). Fixed at all five call sites by routing through a
+//     local temp variable and assigning back to the ivar afterward.
+// ===========================================================
+// 1. RESOLVED (fourth pass, via raw disassembly of FUN_00584b84 and
+//    FUN_0058eb90 directly): Layer A via FUN_0058eb90 is not confined to
+//    session-boundary cleanup (the first-pass doc's "only caller is
+//    FUN_0058442c" was false), and the trigger is no longer unknown either
+//    (the third pass's "opaque bit of param_4, unrecoverable" was also
+//    wrong — that was a decompiler-C-level limitation, not a real
+//    ambiguity). Disassembly shows `cbz x0, LAB_00584e64` sitting
+//    immediately after _objc_retainAutoreleasedReturnValue, immediately
+//    after the call to _TouchSynthesisCreateEvent — it's a direct null
+//    check on the created event, nothing else. FUN_0058eb90 fires exactly
+//    when event creation fails, and its own body confirms an exact
+//    phase->selector map (0/1/3/4 -> touchesBegan/Moved/Ended/Cancelled,
+//    2 -> no-op), passing the possibly-nil event straight through. Now
+//    wired into the normal per-event path (see
+//    -performEventCreationFailureFallbackForTouch:targetView:event:phase:
+//    and its call site in -dispatchHybridTouchAtPoint:phase:inOutTouch:)
+//    instead of left as a dangling manual-only method.
+//    -finalizeAnyActiveTouch: (FUN_0058442c) remains correct as the
+//    separate, confirmed session-cleanup path — the two are genuinely
+//    distinct call sites in the binary, not duplicates.
+// 2. CORRECTED similarly: Layer C is not scrollview-only. The first-pass
+//    doc's claim that _TouchSynthesisPerformGestureRecognizerFallback
+//    "has no caller at all" is false — it's called from FUN_0058fb74,
+//    itself called from FUN_00587624, which IS called directly from the
+//    normal per-tick replay function FUN_00584b84 (on a specific recorded
+//    phase-byte value, not just from the scrollview compensator
+//    FUN_0058dda0). The exact gating condition and the internal
+//    phase-byte's mapping to Began/Moved/Ended/Cancelled could not be
+//    confirmed from this decompilation (may not match the real
+//    UITouchPhase enum used elsewhere in the binary).
+//    -performGestureRecognizerFallbackOnView: remains an explicit,
+//    manually-callable method (fixed internally, see #4/#5) rather than
+//    auto-firing, since the real trigger condition is unconfirmed either
+//    way.
+// 3. sendEvent: now goes to the touch's window directly, falling back to
+//    [UIApplication sharedApplication] only if there's no window — matches
+//    _TouchSynthesisDispatchEvent's own nil check. Previously always went
+//    through UIApplication.
+// 4. Gesture-recognizer state is now set ONCE, all actions for a recognizer
+//    fire, then state is restored ONCE — not set/restore per pair.
+// 5. _targets is now read via KVC (valueForKey:), matching
+//    _TouchSynthesisGestureTargetEntries, not raw Ivar/object_getIvar.
+// 6. The window/view ivar-setter chain's final KVC fallback now uses the
+//    PUBLIC key ("window"/"view"), not "_window"/"_view".
+// 7. Added the associated-object shadow-storage + swizzled -window/-view
+//    fallback that the binary has and this file previously lacked entirely.
+// 8. GSEventProxy offsets: RESOLVED (fourth pass) via raw disassembly of
+//    -[UIEvent(Synthesize) _initWithTouch:], not just the decompiled C.
+//    flags(0x08)/type(0x0C), sizeX/sizeY(0x68, both 1.0), and x3/y3(0x70/0x74,
+//    duplicating x1/y1) all confirmed as before. x1/y1(0x14/0x18) trace to a
+//    genuine [touch locationInView:window] call (d8/d9 -> fcvt -> stp), and
+//    x2/y2(0x1c/0x20) trace to a genuine [touch previousLocationInView:window]
+//    call (d10/d11 -> fcvt -> stp) — not a duplicate of the current point,
+//    and not a "param_2 bit-cast" as the third pass concluded from the
+//    Ghidra C-level view alone. That reading was a decompiler
+//    misattribution of which SSA value fed the store, not a real ambiguity
+//    in the binary. x2/y2 = previousLocationInView:, restored below.
+//    Directly re-confirmed sixth pass: __UIEvent_Synthesize__initWithTouch__
+//    calls -locationInView: and -previousLocationInView: on the touch
+//    itself for x1/y1 and x2/y2, respectively — the low-level struct is
+//    always built FROM the touch's own already-populated state, never from
+//    anything else.
+// 9. The gesture-fallback per-entry respondsToSelector: guard is kept but
+//    now explicitly labeled as an unverified addition, not confirmed
+//    binary behavior (ground truth only checks target != nil && the
+//    action string is non-empty).
+// 12. NEW, third pass: the class-name safety check
+//    (_TouchSynthesisClassNameLooksUnsafeForGestureFallback) rejects more
+//    than WK/_WK prefixes — it also rejects any class name with prefix
+//    "Web" or containing the substring "WebKit". Both
+//    -isSafeGestureFallbackTarget: and -isSafeGestureFallbackTargetEntry:
+//    only checked WK/_WK; fixed below to match all four conditions.
+//
+// SECOND VERIFICATION PASS — traced the actual touch-creation entry point
+// (initInView:at:withCount:) rather than just the setter helpers this file
+// already mirrored. This independently re-confirmed fixes #6/#7 (found
+// via a second, separate function that does the same associated-object
+// store + ivar/private-setter/public-setter/KVC chain) and turned up two
+// real gaps that existed even before this revision:
+// 10. _tapCount was never initialized on a new touch. Confirmed the binary
+//     always writes the touch count (1, for a single-point touch) into it.
+// 11. _touchFlags was never touched at all. Confirmed the binary sets bits
+//     0x1/0x2 on every new touch, and clears bit 0x2 whenever a location
+//     update moves the touch more than 2.0pt in x or y.
+// Two things noted but NOT changed, flagged with lower confidence/out of
+// scope: (a) the binary's init function calls [super init] in a way that
+// implies it may be defined on an actual UITouch subclass rather than a
+// category on UITouch itself — this file still uses a plain UITouch
+// instance; (b) the binary's location setter accepts a point in an
+// arbitrary view's coordinate space and converts it to window coordinates
+// via convertPoint:fromView: — this file still assumes the caller always
+// passes window coordinates directly, which is fine for this file's own
+// demo usage but is narrower than the real API surface.
+// ===========================================================
 
-extern "C" {
-extern IOHIDEventSystemClientRef IOHIDEventSystemClientCreate(CFAllocatorRef allocator);
-extern void IOHIDEventSystemClientDispatchEvent(IOHIDEventSystemClientRef client, IOHIDEventRef event);
-extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEvent(
-    CFAllocatorRef allocator, uint64_t timeStamp, uint32_t index, uint32_t identity,
-    uint32_t eventMask, IOHIDFloat x, IOHIDFloat y, IOHIDFloat z,
-    IOHIDFloat tipPressure, IOHIDFloat twist, Boolean range, Boolean touch, IOOptionBits options);
-extern void IOHIDEventSetSenderID(IOHIDEventRef event, uint64_t senderID);
+
+// ---------------------------------------------------------
+// LOGGING: switched from NSLog to real unified-logging (os_log) calls.
+// As of iOS 26, NSLog redacts dynamic-string format arguments to
+// `<private>` essentially unconditionally — appending %{public}@ to an
+// NSLog call no longer reliably un-redacts it the way it used to on
+// earlier iOS versions. Calling os_log() directly (with an explicit
+// os_log_t handle) is the supported way to get %{public}@ honored again.
+// Initialized via a constructor so gg_log is valid before any +load
+// method in this file (including UITouch's own +load below) can fire.
+// View this with Console.app streaming from the device — the `log`
+// CLI tool and idevicesyslog-style tools have been unreliable for
+// reading back %{public} os_log output on iOS 26 at the time of writing.
+// ---------------------------------------------------------
+static os_log_t gg_log;
+
+__attribute__((constructor))
+static void GG_InitLog(void) {
+    gg_log = os_log_create("com.gg.touchsynthesis", "touch");
 }
 
-static const uint32_t kIOHIDDigitizerEventRange    = 1 << 0;
-static const uint32_t kIOHIDDigitizerEventTouch    = 1 << 1;
-static const uint32_t kIOHIDDigitizerEventPosition = 1 << 2;
-static const uint64_t kIOHIDDigitizerEventSenderID = 0x8000000817319375ULL;
-
-@interface TouchInjector : NSObject
-+ (instancetype)sharedInjector;
-// YES iff IOHIDEventSystemClientCreate succeeded, i.e. injectSwipeFrom:to:duration:
-// can actually reach the HID system. NO on a non-jailbroken/sideloaded install
-// (see init below) -- callers should not report/flash success when this is NO.
-@property (nonatomic, readonly) BOOL isAvailable;
-// start/end are in points, in the same coordinate space as UIScreen.mainScreen.bounds.
-- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
-@end
-
-@implementation TouchInjector {
-    IOHIDEventSystemClientRef _client;
-}
-
-- (BOOL)isAvailable { return _client != nil; }
-
-+ (instancetype)sharedInjector {
-    static TouchInjector *inst = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [TouchInjector new]; });
-    return inst;
-}
-
-- (instancetype)init {
-    self = [super init];
-    if (self) {
-        _client = IOHIDEventSystemClientCreate(kCFAllocatorDefault);
-        if (!_client) os_log(AIPlayerLog(), "TouchInjector: IOHIDEventSystemClientCreate returned NULL "
-                            "(expected on a non-jailbroken device — injection will no-op)");
-    }
-    return self;
-}
-
-- (void)sendFingerEventAtPoint:(CGPoint)p touch:(BOOL)touch range:(BOOL)range identity:(uint32_t)identity {
-    if (!_client) return;
-    uint32_t mask = kIOHIDDigitizerEventRange | kIOHIDDigitizerEventTouch | kIOHIDDigitizerEventPosition;
-    IOHIDEventRef event = IOHIDEventCreateDigitizerFingerEvent(
-        kCFAllocatorDefault, mach_absolute_time(), 0, identity, mask,
-        p.x, p.y, 0, touch ? 1.0 : 0.0, 0, range, touch, 0);
-    if (!event) return;
-    IOHIDEventSetSenderID(event, kIOHIDDigitizerEventSenderID);
-    IOHIDEventSystemClientDispatchEvent(_client, event);
-    CFRelease(event);
-}
-
-// Runs the down->move->up sequence on a background queue via usleep, so this
-// call returns immediately and never blocks the capture callback that
-// triggered it.
-- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
-    static uint32_t identityCounter = 1000;   // arbitrary range, kept away from real-finger identities
-    uint32_t identity = identityCounter++;
-    const NSInteger steps = 8;
-    const NSTimeInterval stepInterval = duration / steps;
-
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
-        [self sendFingerEventAtPoint:start touch:YES range:YES identity:identity];
-        for (NSInteger i = 1; i <= steps; i++) {
-            usleep((useconds_t)(stepInterval * 1e6));
-            CGFloat t = (CGFloat)i / steps;
-            CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
-                                     start.y + (end.y - start.y) * t);
-            [self sendFingerEventAtPoint:p touch:YES range:YES identity:identity];
+// ---------------------------------------------------------
+// -[UIApplication keyWindow] is deprecated (iOS 13+): it doesn't account
+// for multi-scene apps, returning a key window across all connected
+// scenes rather than the actually-active one. This walks connectedScenes
+// for the foreground-active UIWindowScene's key window instead, falling
+// back to the deprecated accessor only pre-iOS 13 or if no active scene
+// can be found (e.g. very early app launch).
+// ---------------------------------------------------------
+static UIWindow *GG_KeyWindow(void) {
+    if (@available(iOS 13.0, *)) {
+        for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
+            if (scene.activationState != UISceneActivationStateForegroundActive) continue;
+            if (![scene isKindOfClass:[UIWindowScene class]]) continue;
+            UIWindowScene *windowScene = (UIWindowScene *)scene;
+            for (UIWindow *window in windowScene.windows) {
+                if (window.isKeyWindow) return window;
+            }
         }
-        usleep((useconds_t)(stepInterval * 1e6));
-        [self sendFingerEventAtPoint:end touch:NO range:NO identity:identity];
-    });
+    }
+    // Fallback: pre-iOS 13, or no active scene found yet (e.g. very early
+    // app launch before a scene has been marked foreground-active).
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    return [UIApplication sharedApplication].keyWindow;
+    #pragma clang diagnostic pop
 }
 
-@end
-
-// =============================================================================
-// MARK: - In-process touch injection (KIF technique, works without jailbreak)
-//
-// TouchInjector above goes through IOHIDEventSystemClient, which requires a
-// SpringBoard-level HID entitlement a Sideloadly-injected, non-jailbroken
-// process cannot obtain (see TouchInjector's -init) -- that's an OS-enforced
-// entitlement/AMFI boundary, not something fixable by writing different code
-// while non-jailbroken.
-//
-// InProcessTouchInjector takes a different path entirely: it never asks the
-// OS to deliver anything system-wide. It reuses UIApplication's own
-// UITouchesEvent object (the same one UIKit's real touch pipeline uses),
-// attaches a hand-crafted IOHIDEventRef to it and to a synthetic UITouch via
-// private setters, and calls -[UIApplication sendEvent:] itself -- entirely
-// in-process, no privileged dispatch involved. This is the technique the KIF
-// iOS UI-testing framework (Apache-2.0, Copyright 2011-2016 Square, Inc.,
-// https://github.com/kif-framework/KIF) has shipped in production for over a
-// decade, including an explicit "iOS 26 compatibility fix" in v3.12.2
-// (https://github.com/kif-framework/KIF/releases) confirming the injection
-// mechanism itself -- as distinct from hit-testing coordinate resolution,
-// which is what that particular fix addressed -- is unchanged on iOS 26.
-// Adapted here from KIF's Sources/KIF/Additions/{UIView,UITouch,UIEvent,
-// UIApplication}-KIFAdditions.{h,m} and Sources/KIF/Classes/IOHIDEvent+KIF.
-// {h,m}, trimmed to just the down/move/up swipe path this needs (no
-// UIWebView/WKWebView special-casing, no multi-finger gestures, no XCTest
-// run-loop pumping).
-//
-// DEFENSIVE BY DESIGN: +isSupported probes every private selector via
-// respondsToSelector:/instancesRespondToSelector: before any of this is
-// ever invoked, and the actual injection sequence is wrapped in @try/@catch
-// as a second line of defense -- if some future iOS renames or removes one
-// of these, this logs clearly once and disables itself for the rest of the
-// session instead of crashing the host game process.
-// =============================================================================
-
-@interface AIOverlayWindow : UIWindow
-@end
-
-// ---- private selectors this relies on (all confirmed present as of KIF
-//      v3.12.3's source, the release with the explicit iOS 26 fix) ----
-
-@interface UIApplication (AIPlayerPrivateTouch)
-- (UIEvent *)_touchesEvent;
-// SPECULATIVE — selector name only confirmed present via method-list dump;
-// argument types below are a guess from the selector shape (touches set,
-// the event, and "touchable" -- presumably the target view/window), not a
-// verified signature. May be for Pencil-style estimated-touch updates
-// specifically rather than general touch registration -- semantics unknown.
-// Wrapped in a respondsToSelector: + NSInvocation-free direct call, and the
-// whole attempt is easy to strip if it doesn't pan out.
-- (void)_registerEstimatedTouches:(NSSet<UITouch *> *)touches event:(UIEvent *)event forTouchable:(id)touchable;
-@end
-
-@interface UIEvent (AIPlayerPrivateTouch)
-// -_clearTouches and -_addTouch:forDelayedDelivery: removed here -- confirmed
-// gone on iOS 26.5 via live method-list dump, not called anywhere anymore.
-- (void)_setHIDEvent:(IOHIDEventRef)event;
-@end
-
-@interface UITouch (AIPlayerPrivateTouch)
-- (void)setWindow:(UIWindow *)window;
-- (void)setView:(UIView *)view;
-- (void)setTapCount:(NSUInteger)tapCount;
+// ---------------------------------------------------------
+// PRIVATE iOS INTERFACES REQUIRED FOR TOUCH SYNTHESIS
+// ---------------------------------------------------------
+@interface UITouch (Private)
 - (void)setPhase:(UITouchPhase)phase;
 - (void)setTimestamp:(NSTimeInterval)timestamp;
-- (void)setGestureView:(UIView *)view;
-- (void)_setLocationInWindow:(CGPoint)location resetPrevious:(BOOL)resetPrevious;
-- (void)_setIsFirstTouchForView:(BOOL)firstTouchForView;
-// NOTE: lowercase "id", different casing than UIEvent's _setHIDEvent: above.
-// Confirmed against KIF's actual current source -- not a typo.
-- (void)_setHidEvent:(IOHIDEventRef)event;
 @end
 
-// ---- low-level hand+finger IOHIDEvent construction, ported from KIF's
-//      IOHIDEvent+KIF.m (same file the "iOS 26 compatibility" release
-//      still ships unchanged) ----
-
-typedef struct { uint32_t hi; uint32_t lo; } AIPlayerAbsoluteTime;
-
-extern "C" {
-extern IOHIDEventRef IOHIDEventCreateDigitizerEvent(
-    CFAllocatorRef allocator, AIPlayerAbsoluteTime timeStamp, uint32_t transducerType,
-    uint32_t index, uint32_t identity, uint32_t eventMask, uint32_t buttonMask,
-    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat tipPressure, IOHIDFloat barrelPressure,
-    Boolean range, Boolean touch, IOOptionBits options);
-extern IOHIDEventRef IOHIDEventCreateDigitizerFingerEventWithQuality(
-    CFAllocatorRef allocator, AIPlayerAbsoluteTime timeStamp, uint32_t index, uint32_t identity, uint32_t eventMask,
-    IOHIDFloat x, IOHIDFloat y, IOHIDFloat z, IOHIDFloat tipPressure, IOHIDFloat twist,
-    IOHIDFloat minorRadius, IOHIDFloat majorRadius, IOHIDFloat quality, IOHIDFloat density, IOHIDFloat irregularity,
-    Boolean range, Boolean touch, IOOptionBits options);
-extern void IOHIDEventAppendEvent(IOHIDEventRef event, IOHIDEventRef childEvent);
-extern void IOHIDEventSetIntegerValue(IOHIDEventRef event, uint32_t field, int value);
+// Memory layout mimicking Apple's internal GSEvent struct.
+// Required to prevent _initWithEvent:touches: from crashing.
+// FIELD OFFSETS confirmed against __UIEvent_Synthesize__initWithTouch__ by
+// computing byte offsets from the decompiled class_t layout: flags(0x08),
+// type(0x0C), x1/y1/x2/y2(0x14-0x23), sizeX/sizeY(0x68/0x6C), x3/y3(0x70/0x74)
+// all land where this struct implies.
+@interface GSEventProxy : NSObject {
+@public
+    unsigned int flags;
+    unsigned int type;
+    unsigned int ignored1;
+    float x1, y1, x2, y2;
+    unsigned int ignored2[10];
+    unsigned int ignored3[7];
+    float sizeX, sizeY;
+    float x3, y3;
+    unsigned int ignored4[3];
 }
-
-static const uint32_t kAIPlayerIOHIDDigitizerTransducerTypeHand = 3;   // kIOHIDDigitizerTransducerTypeHand
-static const uint32_t kAIPlayerIOHIDEventTypeDigitizer          = 11;  // kIOHIDEventTypeDigitizer
-static const uint32_t kAIPlayerIOHIDDigitizerEventRangeFlag     = 0x00000001;
-static const uint32_t kAIPlayerIOHIDDigitizerEventTouchFlag     = 0x00000002;
-static const uint32_t kAIPlayerIOHIDDigitizerEventPositionFlag  = 0x00000004;
-// kIOHIDEventFieldDigitizerIsDisplayIntegrated is the 26th (index 25) entry
-// of the digitizer field enum in KIF's IOHIDEvent+KIF.m -- vendored as a
-// named constant rather than re-deriving the index by hand to avoid an
-// off-by-one.
-static const uint32_t kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated =
-    (kAIPlayerIOHIDEventTypeDigitizer << 16) + 25;
-
-static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
-    uint64_t abTime = mach_absolute_time();
-    AIPlayerAbsoluteTime timeStamp = { (uint32_t)(abTime >> 32), (uint32_t)abTime };
-
-    IOHIDEventRef handEvent = IOHIDEventCreateDigitizerEvent(
-        kCFAllocatorDefault, timeStamp, kAIPlayerIOHIDDigitizerTransducerTypeHand,
-        0, 0, kAIPlayerIOHIDDigitizerEventTouchFlag, 0,
-        0, 0, 0, 0, 0, 0, true, 0);
-    if (!handEvent) {
-        // TEMP DIAGNOSTIC — if this fires, IOHIDEventCreateDigitizerEvent
-        // itself is failing (likely a sandbox/entitlement rejection under
-        // Sideloadly injection), not a downstream dispatch problem. Every
-        // touch built from this point on has no real HID backing.
-        static CFTimeInterval lastLog = 0;
-        CFTimeInterval now = CACurrentMediaTime();
-        if (now - lastLog > 2.0) {
-            lastLog = now;
-            os_log(AIPlayerLog(), "[DIAG] IOHIDEventCreateDigitizerEvent returned NULL — "
-                  "hand event construction failed, no HID event will be attached");
-        }
-        return NULL;
-    }
-    IOHIDEventSetIntegerValue(handEvent, kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-
-    NSUInteger idx = 0;
-    for (UITouch *touch in touches) {
-        uint32_t eventMask = (touch.phase == UITouchPhaseMoved)
-            ? kAIPlayerIOHIDDigitizerEventPositionFlag
-            : (kAIPlayerIOHIDDigitizerEventRangeFlag | kAIPlayerIOHIDDigitizerEventTouchFlag);
-        BOOL isTouching = (touch.phase != UITouchPhaseEnded);
-        CGPoint p = [touch locationInView:touch.window];
-
-        IOHIDEventRef fingerEvent = IOHIDEventCreateDigitizerFingerEventWithQuality(
-            kCFAllocatorDefault, timeStamp, (uint32_t)(idx + 1), 2, eventMask,
-            p.x, p.y, 0, 0, 0, 5.0, 5.0, 1.0, 1.0, 1.0,
-            isTouching, isTouching, 0);
-        idx++;
-        if (!fingerEvent) continue;
-        IOHIDEventSetIntegerValue(fingerEvent, kAIPlayerIOHIDEventFieldDigitizerIsDisplayIntegrated, 1);
-        IOHIDEventAppendEvent(handEvent, fingerEvent);
-        CFRelease(fingerEvent);
-    }
-    return handEvent;
-}
-
-@interface InProcessTouchInjector : NSObject
-+ (instancetype)sharedInjector;
-+ (BOOL)isSupported;   // caches the capability probe; re-checks failure state each call
-@property (nonatomic, readonly) BOOL hasFailedThisSession;
-// start/end are in the target window's coordinate space (see -targetWindow;
-// for a full-screen game window this is the same as UIScreen.mainScreen.bounds).
-- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
+@end
+@implementation GSEventProxy
 @end
 
-@implementation InProcessTouchInjector {
-    BOOL _disabledAfterFailure;
-}
 
-- (BOOL)hasFailedThisSession { return _disabledAfterFailure; }
+// ---------------------------------------------------------
+// FIX #7: Associated-object shadow storage + swizzled -window/-view.
+// CONFIRMED: the binary unconditionally calls objc_setAssociatedObject
+// with the intended window/view BEFORE attempting any ivar write
+// (_TouchSynthesisStoreFallbackTarget), and swizzles UITouch's -window/
+// -view at +load so that if the real accessor ever returns nil, it falls
+// back to the associated object. This file previously had no equivalent,
+// meaning a failed ivar chain on some iOS version would silently break
+// hit-testing/dispatch with no safety net.
+// ---------------------------------------------------------
+static void *kTouchSynthesisFallbackWindowKey = &kTouchSynthesisFallbackWindowKey;
+static void *kTouchSynthesisFallbackViewKey = &kTouchSynthesisFallbackViewKey;
 
-+ (instancetype)sharedInjector {
-    static InProcessTouchInjector *inst = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ inst = [InProcessTouchInjector new]; });
-    return inst;
-}
+@interface UITouch (TouchSynthesisFallback)
+- (id)gg_touchSynthesis_window;
+- (id)gg_touchSynthesis_view;
+@end
 
-+ (BOOL)isSupported {
-    static BOOL supported = NO;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        UIApplication *app = [UIApplication sharedApplication];
-        NSMutableArray<NSString *> *missing = [NSMutableArray array];
+@implementation UITouch (TouchSynthesisFallback)
 
-        // NOTE: -[UIEvent _clearTouches] and -[UIEvent _addTouch:forDelayedDelivery:]
-        // were dropped from this gate. Confirmed via a live class_copyMethodList
-        // dump on-device (iOS 26.5): UIEvent's touch-mutation API is gone
-        // entirely -- no renamed equivalent exists, superclass chain is just
-        // UIEvent -> NSObject so it didn't move to a base class either.
-        // dispatchTouch:phase: below no longer calls either selector; it
-        // mutates the UITouch directly and re-fetches/sends the app's
-        // -_touchesEvent instead. Everything still checked here (below) was
-        // confirmed PRESENT in that same dump.
-        if (![app respondsToSelector:@selector(_touchesEvent)]) [missing addObject:@"-[UIApplication _touchesEvent]"];
-        if (![UIEvent instancesRespondToSelector:@selector(_setHIDEvent:)]) [missing addObject:@"-[UIEvent _setHIDEvent:]"];
-        if (![UITouch instancesRespondToSelector:@selector(_setLocationInWindow:resetPrevious:)]) [missing addObject:@"-[UITouch _setLocationInWindow:resetPrevious:]"];
-        if (![UITouch instancesRespondToSelector:@selector(_setHidEvent:)]) [missing addObject:@"-[UITouch _setHidEvent:]"];
-        if (![UITouch instancesRespondToSelector:@selector(setPhase:)]) [missing addObject:@"-[UITouch setPhase:]"];
-        if (![UITouch instancesRespondToSelector:@selector(setWindow:)]) [missing addObject:@"-[UITouch setWindow:]"];
-
-        if (missing.count > 0) {
-            os_log(AIPlayerLog(), "InProcessTouchInjector: unsupported on this iOS build, missing: %{public}@",
-                  [missing componentsJoinedByString:@", "]);
-            supported = NO;
-        } else {
-            UIEvent *probe = [app _touchesEvent];
-            supported = (probe != nil);
-            if (!supported) os_log(AIPlayerLog(), "InProcessTouchInjector: -[UIApplication _touchesEvent] returned nil");
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Method originalWindow = class_getInstanceMethod(self, @selector(window));
+        Method swizzledWindow = class_getInstanceMethod(self, @selector(gg_touchSynthesis_window));
+        if (originalWindow && swizzledWindow) {
+            method_exchangeImplementations(originalWindow, swizzledWindow);
         }
+
+        Method originalView = class_getInstanceMethod(self, @selector(view));
+        Method swizzledView = class_getInstanceMethod(self, @selector(gg_touchSynthesis_view));
+        if (originalView && swizzledView) {
+            method_exchangeImplementations(originalView, swizzledView);
+        }
+
+        os_log(gg_log, "[Touch]: tweak loaded, -window/-view swizzle %{public}@ (window: %{public}@, view: %{public}@)",
+              (originalWindow && swizzledWindow && originalView && swizzledView) ? @"installed" : @"FAILED — check selector names",
+              originalWindow ? @"ok" : @"MISSING",
+              originalView ? @"ok" : @"MISSING");
     });
-    return supported && !([InProcessTouchInjector sharedInjector].hasFailedThisSession);
 }
 
-- (nullable UIWindow *)targetWindow {
-    UIApplication *app = [UIApplication sharedApplication];
-    UIWindow *fallback = nil;
-
-    NSMutableArray<UIWindow *> *candidateWindows = [NSMutableArray array];
-    for (UIScene *scene in app.connectedScenes) {
-        if (![scene isKindOfClass:[UIWindowScene class]]) continue;
-        UIWindowScene *windowScene = (UIWindowScene *)scene;
-        [candidateWindows addObjectsFromArray:windowScene.windows];
+// NOTE: after the +load swap, sending -gg_touchSynthesis_window to self
+// actually runs the ORIGINAL -window implementation (classic swizzle
+// idiom) — this is not infinite recursion.
+- (id)gg_touchSynthesis_window {
+    id result = [self gg_touchSynthesis_window];
+    if (!result) {
+        result = objc_getAssociatedObject(self, kTouchSynthesisFallbackWindowKey);
     }
-
-    for (UIWindow *w in candidateWindows) {
-        if ([w isKindOfClass:[AIOverlayWindow class]]) continue;   // that's our own toggle-button window, not the game
-        if (w.isKeyWindow) return w;
-        if (!fallback) fallback = w;
-    }
-    return fallback;
+    return result;
 }
 
-- (UITouch *)touchAtPoint:(CGPoint)windowPoint inWindow:(UIWindow *)window {
-    UITouch *touch = [UITouch new];
-    [touch setWindow:window];
-    [touch setTapCount:1];
-    [touch _setLocationInWindow:windowPoint resetPrevious:YES];
-
-    UIView *hit = [window hitTest:windowPoint withEvent:nil];
-    [touch setView:hit];
-    [touch setPhase:UITouchPhaseBegan];
-    if ([touch respondsToSelector:@selector(_setIsFirstTouchForView:)]) {
-        [touch _setIsFirstTouchForView:YES];
+- (id)gg_touchSynthesis_view {
+    id result = [self gg_touchSynthesis_view];
+    if (!result) {
+        result = objc_getAssociatedObject(self, kTouchSynthesisFallbackViewKey);
     }
-    [touch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
-    if ([touch respondsToSelector:@selector(setGestureView:)]) {
-        [touch setGestureView:hit];
-    }
-
-    IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
-    if (hidEvent) {
-        [touch _setHidEvent:hidEvent];
-        CFRelease(hidEvent);
-    }
-    return touch;
+    return result;
 }
 
-- (void)dispatchTouch:(UITouch *)touch phase:(UITouchPhase)phase {
-    [touch setTimestamp:[[NSProcessInfo processInfo] systemUptime]];
-    [touch setPhase:phase];
+@end
 
-    // iOS 26.5 CHANGE: -[UIEvent _clearTouches] and
-    // -[UIEvent _addTouch:forDelayedDelivery:] no longer exist (confirmed via
-    // live method-list dump -- not renamed, just gone; UIEvent's superclass
-    // chain is plain UIEvent -> NSObject, so it didn't move to a base class
-    // either). UIEvent's touch set is no longer externally mutable on this
-    // build. -[UIEvent _setHIDEvent:] is still present, so the working
-    // hypothesis is that UIKit now derives an event's touches from the HID
-    // event's digitizer payload internally, rather than from explicit
-    // _addTouch: calls -- which is also consistent with _setHidEvent: still
-    // being present and settable on UITouch itself.
-    IOHIDEventRef hidEvent = AIPlayerBuildTouchHIDEvent(@[touch]);
-    if (phase == UITouchPhaseBegan) {
-        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: hidEvent=%{public}s",
-              hidEvent ? "attached" : "NULL (no HID backing)");
+
+// ---------------------------------------------------------
+// SYNTHESIS ENGINE (Ground Truth Architecture)
+// ---------------------------------------------------------
+@interface HybridTouchSynthesizer : NSObject
+@property (nonatomic, strong) UIView *excludedTouchView;
+// Simplified single-instance analog of the binary's DAT_0128c0f0 global weak
+// cache — "the control/cell we currently believe the active touch is over."
+// FUN_00587624's FUN_0057efe4 gate compares this against expectations before
+// allowing any UIControl/cell action to fire (see -performControlAndCellFallback...).
+@property (nonatomic, weak) UIControl *currentControl;
+@end
+
+@implementation HybridTouchSynthesizer
+
++ (instancetype)sharedInstance {
+    static HybridTouchSynthesizer *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[HybridTouchSynthesizer alloc] init];
+    });
+    return instance;
+}
+
+// 1. Raw memory write for SCALARS ONLY (coordinates, phase, timestamps)
+- (void)writeScalarIvarOnObject:(id)object name:(const char *)name type:(const char *)type valuePtr:(void *)valuePtr {
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return;
+
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    void *ivarMemory = (uint8_t *)(__bridge void *)object + offset;
+
+    if (strcmp(type, @encode(CGPoint)) == 0) {
+        *(CGPoint *)ivarMemory = *(CGPoint *)valuePtr;
+    } else if (strcmp(type, @encode(UITouchPhase)) == 0) {
+        *(NSInteger *)ivarMemory = *(NSInteger *)valuePtr;
+    } else if (strcmp(type, @encode(NSTimeInterval)) == 0) {
+        *(NSTimeInterval *)ivarMemory = *(NSTimeInterval *)valuePtr;
+    } else if (strcmp(type, @encode(NSInteger)) == 0) {
+        // FIX #10: explicit NSInteger case, used for _tapCount below.
+        // (Previously only reachable via the UITouchPhase branch, which
+        // happens to be the same underlying width but was misleading to
+        // reuse for a non-phase field.)
+        *(NSInteger *)ivarMemory = *(NSInteger *)valuePtr;
     }
-    if (hidEvent) {
-        [touch _setHidEvent:hidEvent];
+}
+
+// Companion reader, needed for fix #8 (capturing the touch's location
+// BEFORE overwriting it, to use as the true "previous" point).
+- (CGPoint)readCGPointIvarOnObject:(id)object name:(const char *)name fallback:(CGPoint)fallback {
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return fallback;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    void *ivarMemory = (uint8_t *)(__bridge void *)object + offset;
+    return *(CGPoint *)ivarMemory;
+}
+
+// FIX #11: raw pointer helper for _touchFlags (a 16-bit bitfield that needs
+// OR/AND bit manipulation, not a full-width overwrite like the fields
+// above). Confirmed present in __UITouch_Synthesize__initInView_at_withCount__
+// (sets bits 0x3 on every new touch) and __UITouch_Synthesize__setLocationInWindow__
+// (clears bit 0x2 when movement exceeds 2.0pt in x or y) — this file
+// previously never touched _touchFlags at all.
+- (void *)rawIvarPointerOnObject:(id)object name:(const char *)name {
+    Ivar ivar = class_getInstanceVariable([object class], name);
+    if (!ivar) return NULL;
+    ptrdiff_t offset = ivar_getOffset(ivar);
+    return (uint8_t *)(__bridge void *)object + offset;
+}
+
+// 2. Defensive Fallback Chain for OBJECTS ONLY (_window, _view)
+- (void)defensiveSetObject:(id)value forProperty:(NSString *)propName onObject:(id)target {
+    // FIX #7: store the associated-object shadow copy first, unconditionally
+    // — matches _TouchSynthesisStoreFallbackTarget's placement before any
+    // ivar attempt below.
+    if ([propName isEqualToString:@"window"]) {
+        objc_setAssociatedObject(target, kTouchSynthesisFallbackWindowKey, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else if ([propName isEqualToString:@"view"]) {
+        objc_setAssociatedObject(target, kTouchSynthesisFallbackViewKey, value, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     }
 
-    UIApplication *app = [UIApplication sharedApplication];
-    UIEvent *event = [app _touchesEvent];
-    if (hidEvent) {
-        [event _setHIDEvent:hidEvent];
-    }
-    if (hidEvent) CFRelease(hidEvent);
+    NSString *ivarName = [NSString stringWithFormat:@"_%@", propName];
+    Ivar ivar = class_getInstanceVariable([target class], [ivarName UTF8String]);
 
-    // RESULT of the previous attempt: event.allTouches.count was 0 on nearly
-    // every swipe -- attaching the HID event alone does NOT make UIKit
-    // auto-populate the touch set. That hypothesis is disproven.
-    //
-    // NEXT ATTEMPT (speculative) -- try -[UIApplication
-    // _registerEstimatedTouches:event:forTouchable:]. Selector name only, no
-    // confirmed signature or semantics; may be Pencil-specific. Guarded by
-    // respondsToSelector: so a mismatched signature just no-ops instead of
-    // crashing if the real signature differs from our guess.
-    if (phase == UITouchPhaseBegan &&
-        [app respondsToSelector:@selector(_registerEstimatedTouches:event:forTouchable:)]) {
-        UIView *touchable = touch.view ?: (id)[self targetWindow];
-        @try {
-            [app _registerEstimatedTouches:[NSSet setWithObject:touch] event:event forTouchable:touchable];
-            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: called, no exception");
-        } @catch (NSException *ex) {
-            os_log(AIPlayerLog(), "[DIAG] _registerEstimatedTouches:event:forTouchable: threw: %{public}@ %{public}@",
-                  ex.name, ex.reason);
+    // Attempt A: Safe Runtime Ivar assignment
+    if (ivar) {
+        object_setIvar(target, ivar, value);
+    } else {
+        os_log(gg_log, "[Touch]: defensiveSetObject %{public}@ — no ivar named %{public}@ found on %{public}@", propName, ivarName, [target class]);
+    }
+
+    // Verify Attempt A
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    id readBack = [target performSelector:NSSelectorFromString(propName)];
+    if (readBack == value) {
+        os_log(gg_log, "[Touch]: defensiveSetObject %{public}@ = %{public}@ succeeded via raw ivar", propName, value);
+        return;
+    }
+
+    // Attempt B: Private Setter (_setWindow: / _setView:)
+    NSString *privateSelectorString = [NSString stringWithFormat:@"_set%@:", [propName capitalizedString]];
+    SEL privateSelector = NSSelectorFromString(privateSelectorString);
+    if ([target respondsToSelector:privateSelector]) {
+        [target performSelector:privateSelector withObject:value];
+        if ([target performSelector:NSSelectorFromString(propName)] == value) {
+            os_log(gg_log, "[Touch]: defensiveSetObject %{public}@ = %{public}@ succeeded via private setter", propName, value);
+            return;
         }
     }
 
-    // TEMP DIAGNOSTIC — allTouches.count AFTER the registration attempt
-    // above, so we can tell whether it changed anything.
-    if (phase == UITouchPhaseBegan) {
-        NSSet *all = [event respondsToSelector:@selector(allTouches)] ? [event allTouches] : nil;
-        os_log(AIPlayerLog(), "[DIAG] dispatchTouch Began: event.allTouches.count=%lu (post-register attempt)",
-              (unsigned long)all.count);
+    // Attempt C: Public Setter (setWindow: / setView:)
+    NSString *publicSelectorString = [NSString stringWithFormat:@"set%@:", [propName capitalizedString]];
+    SEL publicSelector = NSSelectorFromString(publicSelectorString);
+    if ([target respondsToSelector:publicSelector]) {
+        [target performSelector:publicSelector withObject:value];
+        if ([target performSelector:NSSelectorFromString(propName)] == value) {
+            os_log(gg_log, "[Touch]: defensiveSetObject %{public}@ = %{public}@ succeeded via public setter", propName, value);
+            return;
+        }
     }
+    #pragma clang diagnostic pop
 
-    [app sendEvent:event];
+    // Attempt D: KVC Fallback of last resort.
+    // FIX #6: use the PUBLIC key ("window"/"view"), matching
+    // _TouchSynthesisTrySetValue(self, &cf_window/&cf_view, ...) —
+    // previously this used "_window"/"_view", which isn't what the
+    // binary's own last-resort call does.
+    [target setValue:value forKey:propName];
+    #pragma clang diagnostic push
+    #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+    os_log(gg_log, "[Touch]: defensiveSetObject %{public}@ = %{public}@ — raw ivar/private/public setters all failed, used KVC fallback (readback now: %{public}@)",
+          propName, value, [target performSelector:NSSelectorFromString(propName)]);
+    #pragma clang diagnostic pop
 }
 
-// Runs entirely on the main thread (UIKit event delivery requires it), but
-// this call itself returns immediately -- the down/move/up steps are
-// scheduled via dispatch_after on the main queue so the capture callback
-// that triggered this is never blocked.
-- (void)injectSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
-    if (_disabledAfterFailure || ![InProcessTouchInjector isSupported]) return;
+// Shared event builder, factored out so both the normal per-event
+// dispatch and -finalizeAnyActiveTouch: (fix #1) can use identical
+// Layer-B event construction.
+- (UIEvent *)buildSyntheticEventForTouch:(UITouch *)touch atPoint:(CGPoint)point previousPoint:(CGPoint)previousPoint phase:(UITouchPhase)phase {
+    GSEventProxy *gsProxy = [[GSEventProxy alloc] init];
+    gsProxy->x1 = point.x;         gsProxy->y1 = point.y;
+    // FIX #8 (RESOLVED via raw disassembly of -[UIEvent(Synthesize) _initWithTouch:],
+    // and directly re-confirmed sixth pass by reading __UIEvent_Synthesize__initWithTouch__
+    // in iGameGod.c itself): offset 0x14/0x18 (x1/y1) trace directly to a real
+    // [touch locationInView:window] call; offset 0x1c/0x20 (x2/y2) trace to a
+    // real [touch previousLocationInView:window] call. x2/y2 = previousLocationInView:,
+    // NOT a duplicate of the current point.
+    gsProxy->x2 = previousPoint.x; gsProxy->y2 = previousPoint.y;
+    gsProxy->x3 = point.x;         gsProxy->y3 = point.y;
+    gsProxy->sizeX = 1.0;          gsProxy->sizeY = 1.0;
 
-    dispatch_async(dispatch_get_main_queue(), ^{
+    // FIX #13 (SIXTH PASS — REVERTED back to correct; the fifth pass had this
+    // backwards). Ground truth, read directly from
+    // __UIEvent_Synthesize__initWithTouch__ in iGameGod.c:
+    //     uVar9 = 0x1010180;                    // default
+    //     if (phase != Ended(3)) {
+    //         if (phase != Cancelled(4)) {
+    //             uVar9 = 0x3010180;             // override
+    //         }
+    //     }
+    // So Began(0)/Moved(1)/Stationary(2) get the OVERRIDE (0x3010180), and
+    // Ended(3)/Cancelled(4) BOTH keep the DEFAULT (0x1010180). type = 0xbb9
+    // (3001), confirmed constant across all phases.
+    gsProxy->flags = (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled)
+        ? 0x1010180
+        : 0x3010180;
+    gsProxy->type = 3001;
+
+    Class touchesEventClass = NSClassFromString(@"UITouchesEvent");
+    if (!touchesEventClass) {
+        os_log(gg_log, "[Touch]: buildSyntheticEventForTouch — UITouchesEvent class not found via NSClassFromString, falling back to plain UIEvent");
+    }
+    UIEvent *syntheticEvent = [touchesEventClass alloc];
+    NSSet *touchesSet = [NSSet setWithObject:touch];
+
+    if ([syntheticEvent respondsToSelector:@selector(_initWithEvent:touches:)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        syntheticEvent = [syntheticEvent performSelector:@selector(_initWithEvent:touches:) withObject:gsProxy withObject:touchesSet];
+        #pragma clang diagnostic pop
+    } else {
+        os_log(gg_log, "[Touch]: buildSyntheticEventForTouch — _initWithEvent:touches: not available on %{public}@, falling back to plain UIEvent", touchesEventClass);
+        syntheticEvent = [[UIEvent alloc] init];
+    }
+    if (!syntheticEvent) {
+        os_log(gg_log, "[Touch]: buildSyntheticEventForTouch — _initWithEvent:touches: itself returned nil (this triggers the Layer-A fallback path)");
+    } else {
+        // FIX #17 (SIXTH PASS, new): ground truth explicitly writes _timestamp
+        // onto the constructed EVENT object itself immediately after
+        // _initWithEvent:touches: returns non-nil — this file previously only
+        // ever timestamped the touch, never the event.
+        NSTimeInterval eventTimestamp = [[NSProcessInfo processInfo] systemUptime];
+        [self writeScalarIvarOnObject:syntheticEvent name:"_timestamp" type:@encode(NSTimeInterval) valuePtr:&eventTimestamp];
+    }
+    return syntheticEvent;
+}
+
+// FIX #3: send to the touch's window directly, UIApplication only as a
+// nil-window fallback — matches _TouchSynthesisDispatchEvent(event, window):
+// `if (window == nil) [[UIApplication sharedApplication] sendEvent:event];
+//  else [window sendEvent:event];`
+// Also applies the confirmed exclusion-toggle behavior: never skip the
+// send, just briefly disable userInteractionEnabled on the excluded view
+// when it currently owns the dispatch window and is interactive.
+- (void)sendSyntheticEvent:(UIEvent *)syntheticEvent toWindow:(UIWindow *)dispatchWindow {
+    UIView *excluded = self.excludedTouchView;
+    BOOL isExcludable = (excluded != nil &&
+                         excluded.window != nil &&
+                         excluded.window == dispatchWindow &&
+                         excluded.isUserInteractionEnabled);
+
+    os_log(gg_log, "[Touch]: sendSyntheticEvent -> %{public}@ (excludable: %{public}@)",
+          dispatchWindow ? [NSString stringWithFormat:@"%@", dispatchWindow] : @"nil, will use [UIApplication sharedApplication]",
+          isExcludable ? @"YES" : @"NO");
+
+    void (^send)(void) = ^{
+        if (dispatchWindow) {
+            [dispatchWindow sendEvent:syntheticEvent];
+        } else {
+            [[UIApplication sharedApplication] sendEvent:syntheticEvent];
+        }
+    };
+
+    if (isExcludable) {
+        BOOL previousState = excluded.isUserInteractionEnabled;
+        excluded.userInteractionEnabled = NO;
+        send();
+        excluded.userInteractionEnabled = previousState;
+    } else {
+        send();
+    }
+}
+
+// 3. The Core Per-Event Dispatcher (FUN_00584b84's actual per-tick path)
+// FIX #1/#2: this now does Layer B ONLY. Direct responder-chain calls and
+// unconditional gesture-recognizer fallback have been removed from here —
+// see the changelog at the top of this file and -finalizeAnyActiveTouch:
+// below for where Layer A actually belongs.
+- (void)dispatchHybridTouchAtPoint:(CGPoint)point phase:(UITouchPhase)phase inOutTouch:(UITouch **)activeTouch {
+    os_log(gg_log, "[Touch]: dispatchHybridTouchAtPoint (%.1f, %.1f) phase=%ld", point.x, point.y, (long)phase);
+    UIWindow *keyWindow = GG_KeyWindow();
+    if (!keyWindow) {
+        os_log(gg_log, "[Touch]: dispatchHybridTouchAtPoint aborted — GG_KeyWindow() returned nil");
+        return;
+    }
+
+    UITouch *touch = *activeTouch;
+    BOOL isNewTouch = (!touch || phase == UITouchPhaseBegan);
+
+    // Setup UITouch
+    // NOTE (unresolved, not changed here): the binary's touch-creation entry
+    // point calls [super init] with UITouch explicitly as the superclass,
+    // which only compiles that way if the implementing class is itself a
+    // UITouch *subclass* rather than a plain category on UITouch. This file
+    // still allocates a bare UITouch. That's a long-established technique
+    // and should keep working, but it's a structural difference from what
+    // the binary appears to do, worth re-checking if you see odd behavior
+    // tied to +alloc/-init on UITouch specifically.
+    if (isNewTouch) {
+        touch = [[UITouch alloc] init];
+        *activeTouch = touch;
+
+        UIView *targetView = [keyWindow hitTest:point withEvent:nil];
+        if (!targetView) targetView = keyWindow;
+        os_log(gg_log, "[Touch]: new touch — hitTest at (%.1f, %.1f) -> %{public}@", point.x, point.y, targetView);
+        os_log(gg_log, "[Touch]: hitTest view class=%{public}@ gestureRecognizers=%{public}@",
+              NSStringFromClass([targetView class]),
+              targetView.gestureRecognizers);
+
+        [self defensiveSetObject:keyWindow forProperty:@"window" onObject:touch];
+        [self defensiveSetObject:targetView forProperty:@"view" onObject:touch];
+
+        // FIX #10: _tapCount was never initialized before. Confirmed the
+        // binary always writes the passed-in count (1, for a single-point
+        // touch) into _tapCount when a new touch is created.
+        NSInteger tapCount = 1;
+        [self writeScalarIvarOnObject:touch name:"_tapCount" type:@encode(NSInteger) valuePtr:&tapCount];
+
+        // FIX #11: confirmed a brand-new touch always has _touchFlags bits
+        // 0x1 and 0x2 set (`*touchFlags |= 3`) — previously never set here.
+        uint16_t *touchFlagsPtr = (uint16_t *)[self rawIvarPointerOnObject:touch name:"_touchFlags"];
+        if (touchFlagsPtr) *touchFlagsPtr |= 0x3;
+    }
+
+    // Capture the touch's location BEFORE we overwrite it. Used below by
+    // the FIX #11 movement-threshold check, and by GSEventProxy's x2/y2
+    // fields (FIX #8, now resolved via disassembly — see buildSyntheticEventForTouch:).
+    CGPoint previousPoint = isNewTouch
+        ? point
+        : [self readCGPointIvarOnObject:touch name:"_locationInWindow" fallback:point];
+
+    // FIX #11 (continued): confirmed setLocationInWindow: clears _touchFlags
+    // bit 0x2 whenever the move exceeds 2.0pt in x or y. Only applies to
+    // updates on an existing touch — a brand-new touch's flags were just
+    // set above and shouldn't be immediately cleared again.
+    if (!isNewTouch) {
+        CGFloat dx = point.x - previousPoint.x;
+        CGFloat dy = point.y - previousPoint.y;
+        if (fabs(dx) > 2.0 || fabs(dy) > 2.0) {
+            uint16_t *touchFlagsPtr = (uint16_t *)[self rawIvarPointerOnObject:touch name:"_touchFlags"];
+            if (touchFlagsPtr) *touchFlagsPtr &= 0xFFFD;
+        }
+    }
+
+    NSTimeInterval timestamp = [[NSProcessInfo processInfo] systemUptime];
+    [self writeScalarIvarOnObject:touch name:"_locationInWindow" type:@encode(CGPoint) valuePtr:&point];
+    [self writeScalarIvarOnObject:touch name:"_previousLocationInWindow" type:@encode(CGPoint) valuePtr:&previousPoint];
+    [self writeScalarIvarOnObject:touch name:"_phase" type:@encode(UITouchPhase) valuePtr:&phase];
+    [self writeScalarIvarOnObject:touch name:"_timestamp" type:@encode(NSTimeInterval) valuePtr:&timestamp];
+
+    UIEvent *syntheticEvent = [self buildSyntheticEventForTouch:touch atPoint:point previousPoint:previousPoint phase:phase];
+
+    UIWindow *dispatchWindow = touch.window ?: keyWindow;
+    os_log(gg_log, "[Touch]: touch.window=%{public}@ touch.view=%{public}@ syntheticEvent=%{public}@ dispatchWindow=%{public}@",
+          touch.window, touch.view, syntheticEvent ? @"built OK" : @"NIL", dispatchWindow);
+
+    // FIX #1 (RESOLVED): confirmed via disassembly that event creation can
+    // genuinely return nil (a real, reachable path in -[UIEvent(Synthesize)
+    // _initWithTouch:] when the private _initWithEvent:touches: initializer
+    // itself returns nil). When that happens, the binary does NOT call
+    // sendEvent: at all — it routes to FUN_0058eb90 instead. Mirror that here.
+    if (syntheticEvent) {
+        [self sendSyntheticEvent:syntheticEvent toWindow:dispatchWindow];
+    } else {
+        os_log(gg_log, "[Touch]: syntheticEvent was nil — routing to performEventCreationFailureFallbackForTouch (Layer A)");
+    }
+
+    // FIX #18 (SEVENTH PASS — empirical, NOT ground-truth-derived. Flagging
+    // that explicitly since everything else in this file traces to a
+    // decompiled/disassembled source; this one doesn't.):
+    // On-device logging (UnityDiagnostics [Diag] hook) showed real finger
+    // touches firing -[UnityView touchesBegan/Moved/Ended:withEvent:]
+    // immediately every time. The exact same phase sequence sent via
+    // sendSyntheticEvent:toWindow: (Layer B, event always built OK, sendEvent:
+    // always called, no nil, no exception) produced ZERO [Diag] lines for the
+    // entire swipe — sendEvent: is silently swallowing a well-formed event.
+    // That's not the failure mode FUN_0058eb90/Layer A was gated on in the
+    // binary (a nil event) — it's a different, silent delivery failure this
+    // build/device combo exhibits. Given that, Layer A is now called
+    // UNCONDITIONALLY here, not just when event creation fails, since it's
+    // the one path confirmed (by definition — it directly invokes the same
+    // methods real touches land on) to actually reach UnityView.
+    // KNOWN RISK: if sendEvent: DOES work correctly on some other
+    // device/iOS build, this would double-fire touchesBegan/Moved/Ended for
+    // the same touch (once via real delivery, once via this direct call).
+    // Watch for duplicate [Diag] lines per dispatch if you retarget this at
+    // a different device — if that happens, make this an else-branch again
+    // (only on nil OR on a delivery-confirmation timeout) instead of
+    // unconditional.
+    [self performEventCreationFailureFallbackForTouch:touch targetView:touch.view event:syntheticEvent phase:phase];
+
+    if (phase == UITouchPhaseEnded || phase == UITouchPhaseCancelled) {
+        *activeTouch = nil;
+    }
+}
+
+// 3b. FUN_0058eb90 — event-creation-failure fallback (RESOLVED via disassembly
+// of FUN_00584b84 and FUN_0058eb90 directly, not inferred). Confirmed trigger:
+// fires exactly when _TouchSynthesisCreateEvent returns nil (the branch is a
+// literal `cbz x0, ...` on the create-call's return register, immediately
+// after _objc_retainAutoreleasedReturnValue — no intervening instructions,
+// so this is not the "opaque bit of param_4" some earlier analysis claimed).
+// Confirmed exact phase->selector mapping from FUN_0058eb90's own body:
+//   phase 0 (Began)     -> touchesBegan:withEvent:
+//   phase 1 (Moved)     -> touchesMoved:withEvent:
+//   phase 2              -> NO-OP, returns immediately, calls nothing
+//   phase 3 (Ended)     -> touchesEnded:withEvent:
+//   phase 4 (Cancelled) -> touchesCancelled:withEvent:
+// Confirmed: the (possibly-nil) event object is passed straight through as
+// the withEvent: argument in every case — this fallback does not require a
+// valid UIEvent to fire.
+- (void)performEventCreationFailureFallbackForTouch:(UITouch *)touch targetView:(UIView *)targetView event:(UIEvent *)syntheticEvent phase:(UITouchPhase)phase {
+    if (!targetView) return;
+    NSSet *touchesSet = [NSSet setWithObject:touch];
+    switch (phase) {
+        case UITouchPhaseBegan:
+            if ([targetView respondsToSelector:@selector(touchesBegan:withEvent:)])
+                [targetView touchesBegan:touchesSet withEvent:syntheticEvent];
+            break;
+        case UITouchPhaseMoved:
+            if ([targetView respondsToSelector:@selector(touchesMoved:withEvent:)])
+                [targetView touchesMoved:touchesSet withEvent:syntheticEvent];
+            break;
+        case UITouchPhaseStationary:
+            // Confirmed: no-op in the binary. Calls nothing for this phase.
+            break;
+        case UITouchPhaseEnded:
+            if ([targetView respondsToSelector:@selector(touchesEnded:withEvent:)])
+                [targetView touchesEnded:touchesSet withEvent:syntheticEvent];
+            break;
+        case UITouchPhaseCancelled:
+        default:
+            if ([targetView respondsToSelector:@selector(touchesCancelled:withEvent:)])
+                [targetView touchesCancelled:touchesSet withEvent:syntheticEvent];
+            break;
+    }
+}
+
+
+// CONFIRMED: this — not the per-event dispatcher above — is where direct
+// touchesBegan:/Moved:/Ended:/Cancelled:withEvent: calls (Layer A) actually
+// live in the binary. Its only callers there are session teardown
+// (recording stop/clear) and replay-finished/looped. Call this instead of
+// just discarding *activeTouch whenever a swipe/replay sequence is
+// interrupted or torn down mid-flight, so the app doesn't end up thinking
+// a finger is still down.
+- (void)finalizeAnyActiveTouch:(UITouch **)activeTouch {
+    UITouch *touch = *activeTouch;
+    if (!touch) return;
+
+    UIWindow *window = touch.window;
+    if (!window) {
+        os_log(gg_log, "[Touch]: finalizeAnyActiveTouch — touch.window is nil, dropping without dispatch");
+        *activeTouch = nil;
+        return;
+    }
+    os_log(gg_log, "[Touch]: finalizeAnyActiveTouch — phase=%ld window=%{public}@", (long)touch.phase, window);
+
+    UIView *targetView = touch.view;
+    UITouchPhase phase = touch.phase;
+    NSSet *touchesSet = [NSSet setWithObject:touch];
+    CGPoint point = [self readCGPointIvarOnObject:touch name:"_locationInWindow" fallback:CGPointZero];
+    CGPoint previousPoint = [self readCGPointIvarOnObject:touch name:"_previousLocationInWindow" fallback:point];
+    UIEvent *syntheticEvent = [self buildSyntheticEventForTouch:touch atPoint:point previousPoint:previousPoint phase:phase];
+
+    // Layer B first (matches call order in FUN_0058442c).
+    [self sendSyntheticEvent:syntheticEvent toWindow:window];
+
+    // Layer A: dispatch directly based on the touch's actual current phase.
+    if (targetView) {
+        switch (phase) {
+            case UITouchPhaseBegan:
+                if ([targetView respondsToSelector:@selector(touchesBegan:withEvent:)])
+                    [targetView touchesBegan:touchesSet withEvent:syntheticEvent];
+                break;
+            case UITouchPhaseMoved:
+                if ([targetView respondsToSelector:@selector(touchesMoved:withEvent:)])
+                    [targetView touchesMoved:touchesSet withEvent:syntheticEvent];
+                break;
+            case UITouchPhaseStationary:
+                // Confirmed: the binary's cleanup pass silently drops this phase.
+                break;
+            case UITouchPhaseEnded:
+                if ([targetView respondsToSelector:@selector(touchesEnded:withEvent:)])
+                    [targetView touchesEnded:touchesSet withEvent:syntheticEvent];
+                break;
+            case UITouchPhaseCancelled:
+            default:
+                if ([targetView respondsToSelector:@selector(touchesCancelled:withEvent:)])
+                    [targetView touchesCancelled:touchesSet withEvent:syntheticEvent];
+                break;
+        }
+    }
+
+    *activeTouch = nil;
+}
+
+// 4b. FUN_00587624's UIControl/cell action dispatcher, gated by FUN_0057efe4
+// (fifth pass: fully resolved via decompiled C + disassembly cross-check of
+// FUN_0057efe4 itself, obtained via a Ghidra call-graph dump). Both gates
+// and the full 0-4 action-code decision chain are now confirmed, not
+// approximated.
+//
+// CORRECTION to the fourth-pass version: Gate 1 was previously described as
+// "block if the cached control doesn't match" — that was backwards. The
+// real gate value (`local_b8` in the binary) is populated ONLY when the
+// weakly-cached control DOES match the candidate, and even then holds a
+// separate stored field from that cache entry — not a match/mismatch
+// signal. The gate blocks when that field is non-zero, which in practice
+// mostly means "this control was already consumed/fired, don't re-fire
+// it" — a re-entrancy guard, not a match-requirement gate. Renamed
+// accordingly below.
+- (NSInteger)actionCodeForTouch:(UITouch *)touch
+                candidateControl:(UIView *)candidate
+                 boundsContainsPoint:(BOOL)boundsContainsPoint
+                 alreadyConsumedFlag:(BOOL)alreadyConsumedFlag
+                   allTargetsPresent:(BOOL)allTargetsPresent
+                hasSecondaryTargets:(BOOL)hasSecondaryTargets
+                   cellAncestorFound:(BOOL)cellAncestorFound
+                        isKeyWindow:(BOOL)isKeyWindow
+                       touchFlagsBit1:(BOOL)touchFlagsBit1 {
+    // Gate 1 (corrected): re-entrancy guard, not a match requirement.
+    if (alreadyConsumedFlag) return 0;
+    // Gate 2 (confirmed unchanged): touch point must be inside target bounds.
+    if (!boundsContainsPoint) return 0;
+
+    BOOL candidatePresent = (candidate != nil);
+
+    if (allTargetsPresent && candidatePresent) {
+        return 1;
+    }
+    if (touchFlagsBit1) {
+        if (candidatePresent) {
+            return hasSecondaryTargets ? 2 : 3;
+        } else if (cellAncestorFound) {
+            return isKeyWindow ? 0 : 4;
+        } else {
+            return hasSecondaryTargets ? 2 : 3;
+        }
+    }
+    return 0;
+}
+
+// Bounds/cache-gate helper matching the earlier (corrected) semantics, for
+// callers that just need the pass/fail without the full 0-4 action code.
+- (BOOL)shouldAllowControlDispatchForTouch:(UITouch *)touch onView:(UIView *)targetView {
+    if (!targetView) return NO;
+    CGPoint pointInTarget = [touch locationInView:targetView];
+    if (!CGRectContainsPoint(targetView.bounds, pointInTarget)) {
+        return NO;
+    }
+    // alreadyConsumedFlag intentionally not modeled here without a real
+    // cache-entry equivalent wired up; treat as NO (not consumed) by default.
+    return YES;
+}
+
+// NOTE: candidatePresent/allTargetsPresent/hasSecondaryTargets/
+// cellAncestorFound/isKeyWindow/touchFlagsBit1 all need real inputs wired
+// from your call site to use -actionCodeForTouch:... meaningfully — this
+// implements the confirmed DECISION LOGIC precisely, but stops short of
+// wiring live UIKit queries for every input (e.g. what "candidate" vs.
+// touch's own gestureRecognizers/allTargets should be at your call site is
+// still your call, not something uniquely determined by the binary without
+// also resolving param_5 vs param_6's distinct roles, which remains
+// unconfirmed — see param_8 note below).
+// param_8 (a bitflag argument to FUN_00587624 itself, gating an entirely
+// separate FUN_0058f2a0 pre-check before this logic even runs) is also not
+// modeled here — its role wasn't traced.
+
+// 5. Gesture-recognizer fallback (Layer C) — fires target/action directly,
+// bypassing sendEvent:, gated by a bundle-ownership safety check. Not
+// called automatically anywhere in this file anymore (see changelog #2);
+// kept as a standalone, correctly-gated method you can wire up explicitly.
+
+// FIX #12 (third pass): the binary's shared helper
+// (_TouchSynthesisClassNameLooksUnsafeForGestureFallback) checks FOUR
+// conditions, not two — WK: prefix, _WK: prefix, "Web" prefix, and a
+// "WebKit" substring anywhere in the name. An earlier revision only
+// checked the first two at both call sites. Factored into one helper here
+// so the two call sites can't drift out of sync with each other again.
+- (BOOL)classNameLooksUnsafeForGestureFallback:(NSString *)className {
+    if ([className hasPrefix:@"WK"]) return YES;
+    if ([className hasPrefix:@"_WK"]) return YES;
+    if ([className hasPrefix:@"Web"]) return YES;
+    if ([className containsString:@"WebKit"]) return YES;
+    return NO;
+}
+
+- (BOOL)isSafeGestureFallbackTargetEntry:(id)target {
+    // Per-entry check (nested inside the recognizer-level gate below).
+    // Confirmed: if target's bundle is app-owned, entry passes immediately.
+    if (!target) return NO;
+    NSBundle *targetBundle = [NSBundle bundleForClass:[target class]];
+    if (targetBundle == [NSBundle mainBundle]) return YES;
+    NSString *mainPath = [[NSBundle mainBundle] bundlePath];
+    NSString *targetPath = targetBundle.bundlePath;
+    if (targetPath.length > 0 && mainPath.length > 0 && [targetPath hasPrefix:mainPath]) {
+        return YES; // app-owned via path containment
+    }
+
+    // Not app-owned: reject on unsafe class name.
+    NSString *className = NSStringFromClass([target class]);
+    if ([self classNameLooksUnsafeForGestureFallback:className]) return NO;
+
+    // Confirmed polarity: paths under /System/Library or containing
+    // PrivateFrameworks are REJECTED here, not allowed. Everything else
+    // with a non-empty path passes.
+    if (targetPath.length == 0) return NO;
+    if ([targetPath hasPrefix:@"/System/Library"]) return NO;
+    if ([targetPath containsString:@"PrivateFrameworks"]) return NO;
+    return YES;
+}
+
+- (BOOL)isSafeGestureFallbackTarget:(id)target {
+    // Recognizer-level gate: reject only if not app-owned AND class name unsafe.
+    if (!target) return NO;
+    NSBundle *targetBundle = [NSBundle bundleForClass:[target class]];
+    if (targetBundle == [NSBundle mainBundle]) return YES;
+    NSString *mainPath = [[NSBundle mainBundle] bundlePath];
+    NSString *targetPath = targetBundle.bundlePath;
+    BOOL appOwned = (targetPath.length > 0 && mainPath.length > 0 && [targetPath hasPrefix:mainPath]);
+    if (appOwned) return YES;
+    NSString *className = NSStringFromClass([target class]);
+    if ([self classNameLooksUnsafeForGestureFallback:className]) return NO;
+    return YES;
+}
+
+- (id)extractGestureTarget:(id)entry {
+    // Confirmed: binary tries "_target" first, falls back to "target".
+    id target = [entry valueForKey:@"_target"];
+    if (!target) target = [entry valueForKey:@"target"];
+    return target;
+}
+
+- (SEL)extractGestureAction:(id)entry {
+    // Confirmed: binary tries "_action" first, falls back to "action", then
+    // handles three representations: NSString directly; NSValue wrapping a
+    // boxed SEL pointer; otherwise falls back to -description. (Ground
+    // truth actually round-trips the NSValue case through
+    // NSStringFromSelector/NSSelectorFromString rather than casting the
+    // pointer straight to SEL — functionally equivalent for a genuine
+    // boxed SEL, kept as the simpler direct cast here.)
+    id action = [entry valueForKey:@"_action"];
+    if (!action) action = [entry valueForKey:@"action"];
+    if (!action) return NULL;
+
+    if ([action isKindOfClass:[NSString class]]) {
+        return NSSelectorFromString(action);
+    } else if ([action isKindOfClass:[NSValue class]]) {
+        SEL boxed = (SEL)[action pointerValue];
+        return boxed;
+    } else if ([action respondsToSelector:@selector(description)]) {
+        return NSSelectorFromString([action description]);
+    }
+    return NULL;
+}
+
+- (void)performGestureRecognizerFallbackOnView:(UIView *)view {
+    for (UIGestureRecognizer *recognizer in view.gestureRecognizers) {
+        // Recognizer-level gate first.
+        if (![self isSafeGestureFallbackTarget:recognizer]) continue;
+
+        // FIX #5: read _targets via KVC (_TouchSynthesisGestureTargetEntries
+        // is literally [obj valueForKey:@"_targets"]), not raw Ivar access.
+        NSArray *targets = nil;
         @try {
-            UIWindow *window = [self targetWindow];
-            if (!window) {
-                os_log(AIPlayerLog(), "InProcessTouchInjector: no target window found");
-                return;
+            id value = [recognizer valueForKey:@"_targets"];
+            if ([value isKindOfClass:[NSArray class]]) targets = value;
+        } @catch (__unused NSException *exception) {
+            targets = nil;
+        }
+        if (!targets) targets = @[];
+
+        // Confirmed: all-or-nothing per recognizer. If ANY valid
+        // target/action entry fails the per-entry safety check, the binary
+        // aborts the whole recognizer (fires nothing) rather than skipping
+        // just that entry. Validate every entry first, then only fire if
+        // all passed.
+        NSMutableArray *validEntries = [NSMutableArray array];
+        BOOL allSafe = YES;
+        for (id targetEntry in targets) {
+            id targetObj = [self extractGestureTarget:targetEntry];
+            SEL action = [self extractGestureAction:targetEntry];
+            // FIX #9: ground truth's per-entry gate is just
+            // `target != nil && actionString.length != 0` — no
+            // respondsToSelector: check. The check below is kept as an
+            // explicit, UNVERIFIED extra safety net (prevents a crash if a
+            // target genuinely doesn't implement the action) rather than a
+            // confirmed behavior match. Remove it if you want exact parity.
+            if (!targetObj || !action) continue;
+            if (![targetObj respondsToSelector:action]) continue; // unverified addition, see FIX #9
+            if (![self isSafeGestureFallbackTargetEntry:targetObj]) {
+                allSafe = NO;
+                break;
             }
+            [validEntries addObject:@[targetObj, [NSValue valueWithPointer:action]]];
+        }
+        if (!allSafe) continue;
+        if (validEntries.count == 0) continue;
 
-            const NSInteger steps = 8;
-            NSMutableArray<NSValue *> *points = [NSMutableArray arrayWithCapacity:steps + 1];
-            for (NSInteger i = 0; i <= steps; i++) {
-                CGFloat t = (CGFloat)i / steps;
-                CGPoint p = CGPointMake(start.x + (end.x - start.x) * t,
-                                         start.y + (end.y - start.y) * t);
-                [points addObject:[NSValue valueWithCGPoint:p]];
-            }
+        // FIX #4: set state ONCE, fire ALL entries, restore ONCE — matches
+        // _TouchSynthesisPerformGestureRecognizerFallbackWithState, which
+        // sets state before the enumeration loop and restores it after,
+        // not per pair.
+        UIGestureRecognizerState previousState = recognizer.state;
+        [recognizer setValue:@(UIGestureRecognizerStateEnded) forKey:@"state"];
 
-            UITouch *touch = [self touchAtPoint:points[0].CGPointValue inWindow:window];
-            [self dispatchTouch:touch phase:UITouchPhaseBegan];
+        for (NSArray *pair in validEntries) {
+            id targetObj = pair[0];
+            SEL action = (SEL)[pair[1] pointerValue];
 
-            NSTimeInterval stepInterval = duration / steps;
-            for (NSInteger i = 1; i <= steps; i++) {
-                int64_t delayNanos = (int64_t)(stepInterval * i * NSEC_PER_SEC);
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, delayNanos), dispatch_get_main_queue(), ^{
-                    @try {
-                        [touch _setLocationInWindow:points[i].CGPointValue resetPrevious:NO];
-                        [self dispatchTouch:touch phase:(i == steps ? UITouchPhaseEnded : UITouchPhaseMoved)];
-                    } @catch (NSException *ex) {
-                        [self handleFailure:ex];
-                    }
+            #pragma clang diagnostic push
+            #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+            [[UIApplication sharedApplication] sendAction:action to:targetObj from:recognizer forEvent:nil];
+            #pragma clang diagnostic pop
+        }
+
+        [recognizer setValue:@(previousState) forKey:@"state"];
+    }
+}
+@end
+// ---------------------------------------------------------
+@interface FloatingSwipeButtonManager : NSObject
++ (instancetype)sharedInstance;
+- (void)showOverlayButton;
+// Declaration added (method body below is unedited) so
+// -injectSwipeForDirection:confidence:detection: elsewhere in this file can
+// call it without a -Werror "may not respond to selector" build failure.
+- (void)executeSingleShotSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration;
+@end
+
+@implementation FloatingSwipeButtonManager {
+    UIButton *_actionButton;
+    UITouch *_currentPersistentTouch;
+}
+
++ (instancetype)sharedInstance {
+    static FloatingSwipeButtonManager *instance = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        instance = [[FloatingSwipeButtonManager alloc] init];
+    });
+    return instance;
+}
+
+- (void)dealloc {
+    // Demonstrates -finalizeAnyActiveTouch: usage: if the button (and thus
+    // this manager's lifecycle) goes away mid-swipe, make sure the app
+    // isn't left thinking a finger is still down, matching the binary's
+    // own session-teardown behavior rather than silently dropping the touch.
+    if (_currentPersistentTouch) {
+        // ARC won't let you pass &ivar directly to an __autoreleasing
+        // out-param ("passing address of non-local object to
+        // __autoreleasing parameter for write-back") — route through a
+        // local temp instead.
+        UITouch *temp = _currentPersistentTouch;
+        [[HybridTouchSynthesizer sharedInstance] finalizeAnyActiveTouch:&temp];
+        _currentPersistentTouch = temp;
+    }
+}
+
+- (void)showOverlayButton {
+    UIWindow *keyWindow = GG_KeyWindow();
+    if (!keyWindow || _actionButton) {
+        os_log(gg_log, "[Touch]: showOverlayButton aborted — keyWindow=%{public}@ existingButton=%{public}@", keyWindow, _actionButton);
+        return;
+    }
+
+    _actionButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    _actionButton.frame = CGRectMake(20, 100, 70, 70);
+    _actionButton.backgroundColor = [UIColor colorWithRed:0.9 green:0.2 blue:0.2 alpha:0.9];
+    _actionButton.layer.cornerRadius = 35;
+    [_actionButton setTitle:@"Swipe" forState:UIControlStateNormal];
+
+    // Register Exclusion View
+    [HybridTouchSynthesizer sharedInstance].excludedTouchView = _actionButton;
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [_actionButton addGestureRecognizer:pan];
+    [_actionButton addTarget:self action:@selector(triggerSwipe) forControlEvents:UIControlEventTouchUpInside];
+
+    [keyWindow addSubview:_actionButton];
+    os_log(gg_log, "[Touch]: overlay button added to %{public}@", keyWindow);
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan {
+    CGPoint translation = [pan translationInView:pan.view.superview];
+    pan.view.center = CGPointMake(pan.view.center.x + translation.x, pan.view.center.y + translation.y);
+    [pan setTranslation:CGPointZero inView:pan.view.superview];
+}
+
+- (void)triggerSwipe {
+    UIWindow *keyWindow = GG_KeyWindow();
+    if (!keyWindow) return;
+
+    // If a previous swipe never reached Ended/Cancelled for some reason,
+    // finalize it before starting a new one instead of silently leaking it.
+    if (_currentPersistentTouch) {
+        UITouch *temp = _currentPersistentTouch;
+        [[HybridTouchSynthesizer sharedInstance] finalizeAnyActiveTouch:&temp];
+        _currentPersistentTouch = temp;
+    }
+
+    NSInteger direction = arc4random_uniform(4);
+    CGRect bounds = keyWindow.bounds;
+    CGFloat margin = 100.0;
+    CGFloat midX = CGRectGetMidX(bounds);
+    CGFloat midY = CGRectGetMidY(bounds);
+
+    CGPoint start, end;
+    if (direction == 0)      { start = CGPointMake(midX, bounds.size.height - margin); end = CGPointMake(midX, margin); } // Up
+    else if (direction == 1) { start = CGPointMake(midX, margin); end = CGPointMake(midX, bounds.size.height - margin); } // Down
+    else if (direction == 2) { start = CGPointMake(bounds.size.width - margin, midY); end = CGPointMake(margin, midY);  } // Left
+    else                     { start = CGPointMake(margin, midY); end = CGPointMake(bounds.size.width - margin, midY);  } // Right
+
+    os_log(gg_log, "[Touch]: triggerSwipe — direction=%ld start=(%.1f,%.1f) end=(%.1f,%.1f)",
+          (long)direction, start.x, start.y, end.x, end.y);
+    [self executeSingleShotSwipeFrom:start to:end duration:0.3];
+}
+
+- (void)executeSingleShotSwipeFrom:(CGPoint)start to:(CGPoint)end duration:(NSTimeInterval)duration {
+    int steps = 15;
+    NSTimeInterval stepDelay = duration / steps;
+    HybridTouchSynthesizer *synth = [HybridTouchSynthesizer sharedInstance];
+
+    UITouch *beganTouch = _currentPersistentTouch;
+    [synth dispatchHybridTouchAtPoint:start phase:UITouchPhaseBegan inOutTouch:&beganTouch];
+    _currentPersistentTouch = beganTouch;
+
+    for (int i = 1; i <= steps; i++) {
+        CGFloat progress = (CGFloat)i / (CGFloat)steps;
+        CGPoint currentPoint = CGPointMake(
+            start.x + (end.x - start.x) * progress,
+            start.y + (end.y - start.y) * progress
+        );
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * stepDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+            UITouch *movedTouch = self->_currentPersistentTouch;
+            [synth dispatchHybridTouchAtPoint:currentPoint phase:UITouchPhaseMoved inOutTouch:&movedTouch];
+            self->_currentPersistentTouch = movedTouch;
+
+            if (i == steps) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.01 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                    UITouch *endedTouch = self->_currentPersistentTouch;
+                    [synth dispatchHybridTouchAtPoint:currentPoint phase:UITouchPhaseEnded inOutTouch:&endedTouch];
+                    self->_currentPersistentTouch = endedTouch;
                 });
             }
-        } @catch (NSException *ex) {
-            [self handleFailure:ex];
-        }
+        });
+    }
+}
+@end
+
+%hook UIWindow
+- (void)makeKeyAndVisible {
+    %orig;
+    os_log(gg_log, "[Touch]: -[UIWindow makeKeyAndVisible] hook fired for %{public}@ — scheduling overlay button in 1s", self);
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [[FloatingSwipeButtonManager sharedInstance] showOverlayButton];
+    });
+}
+%end
+
+// ---------------------------------------------------------
+// DIAGNOSTIC ONLY — not part of the synthesis engine itself.
+// Confirms whether the synthetic touch actually reaches Unity's own
+// touch handlers on UnityView, or gets intercepted/dropped somewhere
+// between -[UIWindow sendEvent:] and UnityView's override.
+//
+// IMPORTANT (found via the previous test — zero [Diag] lines fired even
+// though hitTest: later found a genuine UnityView instance): %hook
+// blocks install at library-LOAD time by default. UnityView is a class
+// defined inside UnityFramework, which very plausibly hasn't registered
+// its Objective-C classes yet at the moment this dylib is injected —
+// NSClassFromString(@"UnityView") returns nil at that point, so Logos
+// silently skips installing the hook (no crash, no log). UIWindow is a
+// system class that's always present, which is why that hook installed
+// fine while this one didn't. Put in a named group and initialized
+// lazily/retried below instead of relying on the automatic ctor.
+// ---------------------------------------------------------
+%group UnityDiagnostics
+%hook UnityView
+- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+    os_log(gg_log, "[Diag]: UnityView touchesBegan fired — count=%lu touches=%{public}@",
+           (unsigned long)touches.count, touches);
+    %orig;
+}
+- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+    os_log(gg_log, "[Diag]: UnityView touchesMoved fired — count=%lu", (unsigned long)touches.count);
+    %orig;
+}
+- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+    os_log(gg_log, "[Diag]: UnityView touchesEnded fired — count=%lu", (unsigned long)touches.count);
+    %orig;
+}
+- (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
+    os_log(gg_log, "[Diag]: UnityView touchesCancelled fired — count=%lu", (unsigned long)touches.count);
+    %orig;
+}
+%end
+%end // end %group UnityDiagnostics
+
+// Watch for these three outcomes in the log during a triggered swipe,
+// once "[Diag]: UnityView hook installed" confirms the group actually
+// went in:
+//   1. No touchesBegan/Moved/Ended [Diag] lines despite install
+//      succeeding -> the touch really isn't reaching UnityView's
+//      handlers even though the hook is live. Worth testing routing
+//      through [[UIApplication sharedApplication] sendEvent:] instead
+//      of the window directly, in case Unity's actual capture point
+//      sits at the UIApplication level rather than window/view delivery.
+//   2. [Diag] lines appear with the expected phase sequence and touch
+//      count=1 -> the touch is genuinely reaching Unity's native input
+//      code, and whatever is blocking the swipe is downstream of
+//      Objective-C entirely (uninitialized UITouch fields like `type`/
+//      `majorRadius`/`force`, or app-side touch validation).
+//   3. [Diag] lines appear but with an unexpected count/phase pattern
+//      -> the touch is arriving malformed in some way not yet
+//      identified; compare against a REAL manual swipe's [Diag] output
+//      as a baseline to see what differs.
+
+// Recursively retries every 0.5s (up to ~15s) until UnityFramework has
+// registered UnityView as a runtime class, then installs the deferred
+// group. Safe to call repeatedly — %init(UnityDiagnostics) is only
+// ever reached once, on the attempt where the class first exists.
+//
+// Logs unconditionally on EVERY attempt (not just the two terminal
+// outcomes) — the previous version only logged "found" or "gave up",
+// which couldn't distinguish between "never called at all," "retry
+// chain silently stalled partway through," or "class found but the
+// %init(UnityDiagnostics) install itself failed silently." This
+// version removes that blind spot.
+static void GG_TryInstallUnityViewDiagnosticHook(int attemptsRemaining) {
+    Class unityViewClass = NSClassFromString(@"UnityView");
+    os_log(gg_log, "[Diag]: retry check — attemptsRemaining=%d classFound=%{public}@",
+           attemptsRemaining, unityViewClass ? @"YES" : @"NO");
+
+    if (unityViewClass) {
+        os_log(gg_log, "[Diag]: class found — installing deferred UnityDiagnostics group now");
+        %init(UnityDiagnostics);
+        os_log(gg_log, "[Diag]: UnityDiagnostics group init call returned normally (attemptsRemaining=%d)", attemptsRemaining);
+        return;
+    }
+    if (attemptsRemaining <= 0) {
+        os_log(gg_log, "[Diag]: UnityView class never appeared after retries — giving up on diagnostic hook");
+        return;
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        GG_TryInstallUnityViewDiagnosticHook(attemptsRemaining - 1);
     });
 }
 
-- (void)handleFailure:(NSException *)ex {
-    _disabledAfterFailure = YES;
-    os_log(AIPlayerLog(), "InProcessTouchInjector: %{public}@ (%{public}@) -- one of the private selectors this "
-          "relies on didn't behave as expected on this iOS build. Disabling in-process "
-          "injection for the rest of this session; TouchInjector (system HID) remains as "
-          "the fallback path, though it will itself no-op without a jailbreak.",
-          ex.name, ex.reason);
+// Writing our own %ctor disables Logos's automatic one, so UIWindow's
+// hook (previously installed for free) now needs an explicit %init;
+// here too — done immediately, exactly matching its old timing.
+%ctor {
+    // BUILD MARKER: logs unconditionally, first thing, with the actual
+    // compile-time date/time baked in via __DATE__/__TIME__. If this
+    // exact line (or a fresher timestamp than expected) never shows up
+    // in the device log after a rebuild+reinstall+relaunch, the running
+    // binary is stale — none of the logic below it ran at all. Compare
+    // the printed timestamp against when you actually rebuilt.
+    os_log(gg_log, "[Touch]: ===== BUILD MARKER: compiled %{public}s %{public}s =====", __DATE__, __TIME__);
+    %init; // installs all ungrouped hooks (UIWindow) immediately, as before
+    GG_TryInstallUnityViewDiagnosticHook(30); // ~15s of retries for UnityDiagnostics
 }
 
-@end
 
 // =============================================================================
 // MARK: - Passthrough window
@@ -878,6 +1666,9 @@ static IOHIDEventRef AIPlayerBuildTouchHIDEvent(NSArray<UITouch *> *touches) {
 // the key window, so the game's window keeps first-responder/key status
 // at all times — this window only ever exists to host the toggle button.
 // =============================================================================
+
+@interface AIOverlayWindow : UIWindow
+@end
 
 @implementation AIOverlayWindow
 
@@ -1303,40 +2094,17 @@ static NSURL *AIPlayerModelURL(void) {
         case SwipeDirRight: end = CGPointMake(center.x + mag, center.y); break;
     }
 
-    // center/end are computed from the screen bounds; for a normal full-
-    // screen game window this is the same coordinate space InProcessTouchInjector
-    // expects (window.bounds), so no conversion is needed here.
-    if ([InProcessTouchInjector isSupported]) {
-        [[InProcessTouchInjector sharedInjector] injectSwipeFrom:center to:end duration:kSwipeDuration];
-        __weak typeof(self) weakSelf = self;
-        dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf flashInjectionFeedback]; });
-        return;
-    }
-
-    // Fall back to the system-HID path -- only actually delivers on a
-    // jailbroken device (see TouchInjector's -init), but kept as a fallback
-    // in case InProcessTouchInjector ever disables itself mid-session.
-    TouchInjector *injector = [TouchInjector sharedInjector];
-    if (!injector.isAvailable) {
-        // Don't flash gold here -- that would falsely claim the swipe landed.
-        // See TouchInjector's init: on a non-jailbroken/Sideloadly-injected
-        // install, IOHIDEventSystemClientCreate returns NULL and every
-        // injected touch below this point is silently dropped by design.
-        // The detection/direction pipeline is working correctly (that's why
-        // we got this far) -- this is strictly a "can't reach the HID
-        // system from here" limitation, not a model or preprocessing bug.
-        static CFTimeInterval lastUnavailableLog = 0;
-        CFTimeInterval now = CACurrentMediaTime();
-        if (now - lastUnavailableLog > 5.0) {
-            lastUnavailableLog = now;
-            os_log(AIPlayerLog(), "swipe dir=%ld conf=%.2f det=%.2f — model fired correctly but "
-                  "neither InProcessTouchInjector nor TouchInjector can deliver on this "
-                  "install; swipe NOT delivered", (long)dir, conf, det);
-        }
-        return;
-    }
-
-    [injector injectSwipeFrom:center to:end duration:kSwipeDuration];
+    // center/end are computed from the screen bounds; GG_KeyWindow() (used
+    // throughout HybridTouchSynthesizer) resolves to the same window whose
+    // bounds these points were computed from, so no conversion is needed.
+    //
+    // Delivered through FloatingSwipeButtonManager's own, unedited
+    // -executeSingleShotSwipeFrom:to:duration: (see the ported engine MARK
+    // block above) -- the exact same method -triggerSwipe calls for its own
+    // random-direction demo swipe, just given the model's predicted
+    // start/end points instead of a random direction. No dispatch logic is
+    // reimplemented here.
+    [[FloatingSwipeButtonManager sharedInstance] executeSingleShotSwipeFrom:center to:end duration:kSwipeDuration];
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf flashInjectionFeedback]; });
