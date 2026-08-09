@@ -404,7 +404,8 @@ static inline int32_t floorDiv(int32_t a, int32_t b) {
 // button, and tapping it fires an independent random-direction demo swipe
 // through this same engine. Left in because it's a real method in the
 // source file and the instruction was every method, no edits -- remove the
-// %hook UIWindow block below if you don't want that second button.
+// UIWindow(GGMakeKeyAndVisibleHook) category below if you don't want that
+// second button.
 // =============================================================================
 
 // ===========================================================
@@ -1533,15 +1534,44 @@ static void *kTouchSynthesisFallbackViewKey = &kTouchSynthesisFallbackViewKey;
 }
 @end
 
-%hook UIWindow
-- (void)makeKeyAndVisible {
-    %orig;
+// ---------------------------------------------------------
+// NOT a Logos %hook — see the note above GG_SwizzleClassMethod further
+// down for why (short version: MSHookMessageEx needs MobileSubstrate on
+// the device, which this Sideloadly/non-jailbroken deployment doesn't
+// have). Same method_exchangeImplementations idiom as UITouch
+// (TouchSynthesisFallback) above, just applied to UIWindow instead.
+// ---------------------------------------------------------
+@interface UIWindow (GGMakeKeyAndVisibleHook)
+- (void)gg_makeKeyAndVisible;
+@end
+
+@implementation UIWindow (GGMakeKeyAndVisibleHook)
+
++ (void)load {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        Method original = class_getInstanceMethod(self, @selector(makeKeyAndVisible));
+        Method swizzled = class_getInstanceMethod(self, @selector(gg_makeKeyAndVisible));
+        if (original && swizzled) {
+            method_exchangeImplementations(original, swizzled);
+        }
+        os_log(gg_log, "[Touch]: -[UIWindow makeKeyAndVisible] swizzle %{public}@",
+              (original && swizzled) ? @"installed" : @"FAILED — check selector names");
+    });
+}
+
+// Post-swap, sending -gg_makeKeyAndVisible to self actually runs the
+// ORIGINAL -makeKeyAndVisible implementation (classic swizzle idiom, same
+// as -gg_touchSynthesis_window/-view above) — this is not infinite recursion.
+- (void)gg_makeKeyAndVisible {
+    [self gg_makeKeyAndVisible];
     os_log(gg_log, "[Touch]: -[UIWindow makeKeyAndVisible] hook fired for %{public}@ — scheduling overlay button in 1s", self);
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [[FloatingSwipeButtonManager sharedInstance] showOverlayButton];
     });
 }
-%end
+
+@end
 
 // ---------------------------------------------------------
 // DIAGNOSTIC ONLY — not part of the synthesis engine itself.
@@ -1560,31 +1590,68 @@ static void *kTouchSynthesisFallbackViewKey = &kTouchSynthesisFallbackViewKey;
 // fine while this one didn't. Put in a named group and initialized
 // lazily/retried below instead of relying on the automatic ctor.
 // ---------------------------------------------------------
-%group UnityDiagnostics
-%hook UnityView
-- (void)touchesBegan:(NSSet *)touches withEvent:(UIEvent *)event {
+// ---------------------------------------------------------
+// GG_SwizzleClassMethod: swaps in a replacement IMP for a selector on a
+// class that's only resolvable at RUNTIME (UnityView lives inside
+// UnityFramework — there's no compile-time header for it, so the
+// category+method_exchangeImplementations idiom used for UIWindow/UITouch
+// above doesn't apply directly; there's no selector to declare a category
+// method under). method_setImplementation is the standard equivalent for
+// this case: it swaps the method's IMP in place and hands back the
+// original IMP directly, which the replacement below calls to chain
+// through — the swizzle-on-an-unknown-class version of Logos's %orig.
+//
+// NOT a Logos %hook, same reason as the UIWindow swizzle above: %hook
+// compiles to MSHookMessageEx, which needs MobileSubstrate installed on
+// the device (and which is also what emitted the
+// `.linker_option "-framework CydiaSubstrate"` directive that broke the CI
+// link step even under a plain `library` Makefile target — that directive
+// comes from Logos's generated code itself, not anything in this Makefile,
+// so switching Makefile target types alone can't fix it). This project's
+// deployment target is non-jailbroken/Sideloadly-injected, so
+// MobileSubstrate isn't just unnecessary here, it's actually absent on
+// device — %hook's generated code would fail to resolve at load time even
+// if the build itself succeeded. method_setImplementation/
+// method_exchangeImplementations need nothing beyond the Objective-C
+// runtime itself, which is always present.
+// ---------------------------------------------------------
+typedef void (*GGTouchesEventIMP)(id, SEL, NSSet *, UIEvent *);
+
+static GGTouchesEventIMP GG_OrigTouchesBegan;
+static GGTouchesEventIMP GG_OrigTouchesMoved;
+static GGTouchesEventIMP GG_OrigTouchesEnded;
+static GGTouchesEventIMP GG_OrigTouchesCancelled;
+
+static void GG_Diag_TouchesBegan(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
     os_log(gg_log, "[Diag]: UnityView touchesBegan fired — count=%lu touches=%{public}@",
            (unsigned long)touches.count, touches);
-    %orig;
+    if (GG_OrigTouchesBegan) GG_OrigTouchesBegan(self, _cmd, touches, event);
 }
-- (void)touchesMoved:(NSSet *)touches withEvent:(UIEvent *)event {
+static void GG_Diag_TouchesMoved(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
     os_log(gg_log, "[Diag]: UnityView touchesMoved fired — count=%lu", (unsigned long)touches.count);
-    %orig;
+    if (GG_OrigTouchesMoved) GG_OrigTouchesMoved(self, _cmd, touches, event);
 }
-- (void)touchesEnded:(NSSet *)touches withEvent:(UIEvent *)event {
+static void GG_Diag_TouchesEnded(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
     os_log(gg_log, "[Diag]: UnityView touchesEnded fired — count=%lu", (unsigned long)touches.count);
-    %orig;
+    if (GG_OrigTouchesEnded) GG_OrigTouchesEnded(self, _cmd, touches, event);
 }
-- (void)touchesCancelled:(NSSet *)touches withEvent:(UIEvent *)event {
+static void GG_Diag_TouchesCancelled(id self, SEL _cmd, NSSet *touches, UIEvent *event) {
     os_log(gg_log, "[Diag]: UnityView touchesCancelled fired — count=%lu", (unsigned long)touches.count);
-    %orig;
+    if (GG_OrigTouchesCancelled) GG_OrigTouchesCancelled(self, _cmd, touches, event);
 }
-%end
-%end // end %group UnityDiagnostics
+
+// Returns NO (leaving *origOut untouched) if `cls` doesn't implement
+// `selector` at all, so a caller can tell a genuine miss apart from success.
+static BOOL GG_SwizzleClassMethod(Class cls, SEL selector, IMP replacementIMP, IMP *origOut) {
+    Method m = class_getInstanceMethod(cls, selector);
+    if (!m) return NO;
+    *origOut = method_setImplementation(m, replacementIMP);
+    return YES;
+}
 
 // Watch for these three outcomes in the log during a triggered swipe,
-// once "[Diag]: UnityView hook installed" confirms the group actually
-// went in:
+// once "[Diag]: UnityView touch diagnostics install succeeded" confirms
+// the swizzle actually went in:
 //   1. No touchesBegan/Moved/Ended [Diag] lines despite install
 //      succeeding -> the touch really isn't reaching UnityView's
 //      handlers even though the hook is live. Worth testing routing
@@ -1602,25 +1669,35 @@ static void *kTouchSynthesisFallbackViewKey = &kTouchSynthesisFallbackViewKey;
 //      as a baseline to see what differs.
 
 // Recursively retries every 0.5s (up to ~15s) until UnityFramework has
-// registered UnityView as a runtime class, then installs the deferred
-// group. Safe to call repeatedly — %init(UnityDiagnostics) is only
-// ever reached once, on the attempt where the class first exists.
+// registered UnityView as a runtime class, then installs the swizzles.
+// Safe to call repeatedly — GG_SwizzleClassMethod is idempotent enough
+// for this purpose (each call just re-swaps the current IMP), and this
+// only ever reaches the install branch once in practice, on the attempt
+// where the class first exists.
 //
 // Logs unconditionally on EVERY attempt (not just the two terminal
-// outcomes) — the previous version only logged "found" or "gave up",
-// which couldn't distinguish between "never called at all," "retry
-// chain silently stalled partway through," or "class found but the
-// %init(UnityDiagnostics) install itself failed silently." This
-// version removes that blind spot.
+// outcomes) — an earlier version only logged "found" or "gave up", which
+// couldn't distinguish "never called at all" from "retry chain silently
+// stalled partway through" from "class found but the install itself
+// failed silently." This version removes that blind spot.
 static void GG_TryInstallUnityViewDiagnosticHook(int attemptsRemaining) {
     Class unityViewClass = NSClassFromString(@"UnityView");
     os_log(gg_log, "[Diag]: retry check — attemptsRemaining=%d classFound=%{public}@",
            attemptsRemaining, unityViewClass ? @"YES" : @"NO");
 
     if (unityViewClass) {
-        os_log(gg_log, "[Diag]: class found — installing deferred UnityDiagnostics group now");
-        %init(UnityDiagnostics);
-        os_log(gg_log, "[Diag]: UnityDiagnostics group init call returned normally (attemptsRemaining=%d)", attemptsRemaining);
+        os_log(gg_log, "[Diag]: class found — installing UnityView touch diagnostics now");
+        BOOL ok = YES;
+        ok &= GG_SwizzleClassMethod(unityViewClass, @selector(touchesBegan:withEvent:),
+                                     (IMP)GG_Diag_TouchesBegan, (IMP *)&GG_OrigTouchesBegan);
+        ok &= GG_SwizzleClassMethod(unityViewClass, @selector(touchesMoved:withEvent:),
+                                     (IMP)GG_Diag_TouchesMoved, (IMP *)&GG_OrigTouchesMoved);
+        ok &= GG_SwizzleClassMethod(unityViewClass, @selector(touchesEnded:withEvent:),
+                                     (IMP)GG_Diag_TouchesEnded, (IMP *)&GG_OrigTouchesEnded);
+        ok &= GG_SwizzleClassMethod(unityViewClass, @selector(touchesCancelled:withEvent:),
+                                     (IMP)GG_Diag_TouchesCancelled, (IMP *)&GG_OrigTouchesCancelled);
+        os_log(gg_log, "[Diag]: UnityView touch diagnostics install %{public}@ (attemptsRemaining=%d)",
+               ok ? @"succeeded" : @"PARTIALLY FAILED — check selector availability", attemptsRemaining);
         return;
     }
     if (attemptsRemaining <= 0) {
@@ -1632,10 +1709,11 @@ static void GG_TryInstallUnityViewDiagnosticHook(int attemptsRemaining) {
     });
 }
 
-// Writing our own %ctor disables Logos's automatic one, so UIWindow's
-// hook (previously installed for free) now needs an explicit %init;
-// here too — done immediately, exactly matching its old timing.
-%ctor {
+// UIWindow's swizzle installs itself via +load automatically (see
+// UIWindow(GGMakeKeyAndVisibleHook) above) — this constructor only needs
+// to log the build marker and kick off the UnityView retry loop.
+__attribute__((constructor))
+static void GG_Init(void) {
     // BUILD MARKER: logs unconditionally, first thing, with the actual
     // compile-time date/time baked in via __DATE__/__TIME__. If this
     // exact line (or a fresher timestamp than expected) never shows up
@@ -1643,7 +1721,6 @@ static void GG_TryInstallUnityViewDiagnosticHook(int attemptsRemaining) {
     // binary is stale — none of the logic below it ran at all. Compare
     // the printed timestamp against when you actually rebuilt.
     os_log(gg_log, "[Touch]: ===== BUILD MARKER: compiled %{public}s %{public}s =====", __DATE__, __TIME__);
-    %init; // installs all ungrouped hooks (UIWindow) immediately, as before
     GG_TryInstallUnityViewDiagnosticHook(30); // ~15s of retries for UnityDiagnostics
 }
 
