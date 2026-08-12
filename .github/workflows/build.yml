@@ -153,8 +153,15 @@ jobs:
         id: find_dylib
         run: |
           set -euo pipefail
-          TOUCHSYNTH_PATH="TouchSynthesis/.theos/obj/arm64/TouchSynthesis.dylib"
-          AIPLAYER_PATH="AIPlayer/.theos/obj/arm64/AIPlayer.dylib"
+          # Theos's SUBPROJECTS mechanism shares ONE .theos/obj/<arch> build
+          # directory rooted at the top-level project (this repo root) --
+          # NOT a separate .theos tree per subproject directory. Confirmed
+          # against an actual failed build: the linker error showed
+          # AIPlayer.dylib's own target path as
+          # $GITHUB_WORKSPACE/.theos/obj/arm64/AIPlayer.dylib, i.e. repo
+          # root, not AIPlayer/.theos/obj/...
+          TOUCHSYNTH_PATH=".theos/obj/arm64/TouchSynthesis.dylib"
+          AIPLAYER_PATH=".theos/obj/arm64/AIPlayer.dylib"
           for p in "$TOUCHSYNTH_PATH" "$AIPLAYER_PATH"; do
             if [ ! -f "$p" ]; then
               echo "ERROR: $p not found. Check the 'Build dylibs' step log above."

@@ -18,8 +18,12 @@
 # Theos project via a recursive `make`, IN THE ORDER LISTED, one fully
 # finishing before the next starts. That ordering guarantee is exactly why
 # TouchSynthesis is listed first: AIPlayer/Makefile's link step reads
-# ../TouchSynthesis/.theos/obj/arm64/TouchSynthesis.dylib directly, which
-# must already exist by the time AIPlayer links.
+# ../.theos/obj/arm64/TouchSynthesis.dylib directly (Theos's SUBPROJECTS
+# share ONE .theos/obj/<arch> build directory rooted at THIS file's own
+# directory, not a separate .theos tree per subproject -- confirmed
+# against an actual build failure, see AIPlayer/Makefile's comment for
+# the full explanation), which must already exist by the time AIPlayer
+# links.
 #
 # `make FINALPACKAGE=1 V=1` at this root level (see build.yml) propagates
 # both variables into each subproject's recursive make automatically —
