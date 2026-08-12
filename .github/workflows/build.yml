@@ -134,13 +134,16 @@ jobs:
           print("Dummy forward pass succeeded.")
           PYEOF
 
-      # ── Build the dylib ──────────────────────────────────────────────────
-      # No dpkg-deb, ldid, or fakeroot needed anymore: this is a plain
-      # `library` target (see Makefile), not a `tweak` target, so there's no
-      # .deb to package and no ad-hoc signing step to fake root ownership
-      # for. `make` alone produces the unsigned arm64 dylib; Sideloadly does
-      # its own signing when it injects and installs.
-      - name: Build dylib
+      # ── Build the dylibs ─────────────────────────────────────────────────
+      # No dpkg-deb, ldid, or fakeroot needed anymore: these are plain
+      # `library` targets (see Makefile / TouchSynthesis/Makefile /
+      # AIPlayer/Makefile), not `tweak` targets, so there's no .deb to
+      # package and no ad-hoc signing step to fake root ownership for.
+      # `make` alone produces two unsigned arm64 dylibs -- TouchSynthesis
+      # (the touch-synthesis module) and AIPlayer (links against it) --
+      # via the root Makefile's SUBPROJECTS, built in that order. Sideloadly
+      # does its own signing when it injects and installs both.
+      - name: Build dylibs
         run: |
           set -euo pipefail
           make clean || true
@@ -150,24 +153,37 @@ jobs:
         id: find_dylib
         run: |
           set -euo pipefail
-          DYLIB_PATH=".theos/obj/arm64/AIPlayer.dylib"
-          if [ ! -f "$DYLIB_PATH" ]; then
-            echo "ERROR: $DYLIB_PATH not found. Check the 'Build dylib' step log above."
-            exit 1
-          fi
-          echo "dylib_path=$DYLIB_PATH" >> "$GITHUB_OUTPUT"
+          TOUCHSYNTH_PATH="TouchSynthesis/.theos/obj/arm64/TouchSynthesis.dylib"
+          AIPLAYER_PATH="AIPlayer/.theos/obj/arm64/AIPlayer.dylib"
+          for p in "$TOUCHSYNTH_PATH" "$AIPLAYER_PATH"; do
+            if [ ! -f "$p" ]; then
+              echo "ERROR: $p not found. Check the 'Build dylibs' step log above."
+              exit 1
+            fi
+          done
+          echo "touchsynthesis_path=$TOUCHSYNTH_PATH" >> "$GITHUB_OUTPUT"
+          echo "dylib_path=$AIPLAYER_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Upload dylib
+      - name: Upload AIPlayer dylib
         uses: actions/upload-artifact@v4
         with:
           name: AIPlayer-dylib
           path: ${{ steps.find_dylib.outputs.dylib_path }}
           if-no-files-found: error
 
+      - name: Upload TouchSynthesis dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: TouchSynthesis-dylib
+          path: ${{ steps.find_dylib.outputs.touchsynthesis_path }}
+          if-no-files-found: error
+
       # ── Sideloadly deployment artifact ───────────────────────────────────
       # Zip, don't tar: this is meant to be unzipped by hand on macOS/Windows
       # before dragging the resulting SwipeAnnotator.mlmodelc folder into
-      # Sideloadly alongside AIPlayer.dylib. Zipping it ourselves first keeps
+      # Sideloadly alongside AIPlayer.dylib AND TouchSynthesis.dylib (both
+      # dylibs must be injected together now -- AIPlayer.dylib depends on
+      # TouchSynthesis.dylib at load time). Zipping it ourselves first keeps
       # SwipeAnnotator.mlmodelc's internal directory structure intact as a
       # single nameable download, rather than relying on the double-zip
       # actions/upload-artifact would otherwise produce from a bare folder.
