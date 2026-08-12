@@ -25,7 +25,12 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/theos
-          key: theos-${{ runner.os }}-${{ hashFiles('**/Makefile') }}-v1
+          # -v2: bumped after switching TouchSynthesis+AIPlayer from
+          # Theos SUBPROJECTS to a single-Makefile multi-instance build
+          # (see root Makefile's header comment for why) -- forces a
+          # fully clean Theos reinstall once, ruling out any stale cache
+          # state left over from the SUBPROJECTS-based structure.
+          key: theos-${{ runner.os }}-${{ hashFiles('**/Makefile') }}-v2
           restore-keys: |
             theos-${{ runner.os }}-
 
@@ -136,13 +141,12 @@ jobs:
 
       # ── Build the dylibs ─────────────────────────────────────────────────
       # No dpkg-deb, ldid, or fakeroot needed anymore: these are plain
-      # `library` targets (see Makefile / TouchSynthesis/Makefile /
-      # AIPlayer/Makefile), not `tweak` targets, so there's no .deb to
-      # package and no ad-hoc signing step to fake root ownership for.
-      # `make` alone produces two unsigned arm64 dylibs -- TouchSynthesis
-      # (the touch-synthesis module) and AIPlayer (links against it) --
-      # via the root Makefile's SUBPROJECTS, built in that order. Sideloadly
-      # does its own signing when it injects and installs both.
+      # `library` instances (LIBRARY_NAME = TouchSynthesis AIPlayer in the
+      # root Makefile), not `tweak` targets, so there's no .deb to package
+      # and no ad-hoc signing step to fake root ownership for. `make` alone
+      # produces two unsigned arm64 dylibs -- TouchSynthesis (the touch-
+      # synthesis module) built first, then AIPlayer (links against it).
+      # Sideloadly does its own signing when it injects and installs both.
       - name: Build dylibs
         run: |
           set -euo pipefail
@@ -153,13 +157,8 @@ jobs:
         id: find_dylib
         run: |
           set -euo pipefail
-          # Theos's SUBPROJECTS mechanism shares ONE .theos/obj/<arch> build
-          # directory rooted at the top-level project (this repo root) --
-          # NOT a separate .theos tree per subproject directory. Confirmed
-          # against an actual failed build: the linker error showed
-          # AIPlayer.dylib's own target path as
-          # $GITHUB_WORKSPACE/.theos/obj/arm64/AIPlayer.dylib, i.e. repo
-          # root, not AIPlayer/.theos/obj/...
+          # Both instances land in this repo root's .theos/obj/arm64/ --
+          # confirmed Theos behavior (see root Makefile's header comment).
           TOUCHSYNTH_PATH=".theos/obj/arm64/TouchSynthesis.dylib"
           AIPLAYER_PATH=".theos/obj/arm64/AIPlayer.dylib"
           for p in "$TOUCHSYNTH_PATH" "$AIPLAYER_PATH"; do
