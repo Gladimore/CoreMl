@@ -1,3 +1,0 @@
-_TouchSynthesisKeyWindow
-_OBJC_CLASS_$_HybridTouchSynthesizer
-_OBJC_METACLASS_$_HybridTouchSynthesizer

@@ -25,12 +25,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/theos
-          # -v2: bumped after switching TouchSynthesis+AIPlayer from
-          # Theos SUBPROJECTS to a single-Makefile multi-instance build
-          # (see root Makefile's header comment for why) -- forces a
-          # fully clean Theos reinstall once, ruling out any stale cache
-          # state left over from the SUBPROJECTS-based structure.
-          key: theos-${{ runner.os }}-${{ hashFiles('**/Makefile') }}-v2
+          key: theos-${{ runner.os }}-${{ hashFiles('**/Makefile') }}-v1
           restore-keys: |
             theos-${{ runner.os }}-
 
@@ -58,96 +53,37 @@ jobs:
           # torch pinned per coremltools' own compatibility notes.
           pip install torch==2.7.0 coremltools
 
-      # ── Checkpoint -> Core ML ────────────────────────────────────────────
-      # Produces SwipeAnnotator.mlmodelc in the repo root. This step MUST
-      # run before the dylib build (the Makefile no longer stages the model
-      # at all -- it ships as its own independent artifact, see below).
-      #
-      # convert_to_coreml.py emits the "neuralnetwork" Core ML spec format,
-      # whose container is a single .mlmodel file -- NOT .mlpackage (that's
-      # the ML Program format's container, and mixing the two produces a
-      # .mlmodelc with no valid compiled model inside it, which then fails
-      # opaquely at load time). See convert_to_coreml.py's module docstring
-      # for why "neuralnetwork" is used here.
-      #
-      # --checkpoint points at checkpoints/best.pt, committed to this repo.
-      # If your checkpoint lives somewhere else (Kaggle, cloud storage),
-      # replace this with a download step that produces that same path
-      # before the conversion runs.
+      # ── Checkpoint -> two Core ML models ─────────────────────────────────
+      # convert_to_coreml.py exports SwipeEncoder.mlmodel (per-frame CNN) and
+      # SwipeHead.mlmodel (windowed GRU head, zero initial state), then
+      # verifies on this macOS runner that
+      #   (1) the unrolled torch pipeline equals model.forward(), and
+      #   (2) the saved Core ML models, run on CPU, equal model.forward().
+      # Any mismatch fails the build, so a model that does not match what
+      # training validated can never be packaged.
       - name: Convert checkpoint to Core ML
         run: |
           set -euo pipefail
           python convert_to_coreml.py \
             --checkpoint checkpoints/best.pt \
-            --out SwipeAnnotator.mlmodel \
+            --out_dir . \
             --img_size 128
 
-          # `xcrun coremlcompiler compile` can print errors and still exit 0,
-          # so treat any "error" text in its output as fatal regardless of
-          # exit code.
-          xcrun coremlcompiler compile SwipeAnnotator.mlmodel . 2>&1 | tee /tmp/coremlcompiler.log
-          compiler_status=${PIPESTATUS[0]}
-          if [ "$compiler_status" -ne 0 ] || grep -qi "error" /tmp/coremlcompiler.log; then
-            echo "ERROR: coremlcompiler reported a failure (or nonzero exit) -- see log above."
-            exit 1
-          fi
+      # `coremlcompiler` can print errors and still exit 0, so any "error"
+      # text in its output is treated as fatal regardless of exit code.
+      - name: Compile Core ML models
+        run: |
+          set -euo pipefail
+          for name in SwipeEncoder SwipeHead; do
+            xcrun coremlcompiler compile "$name.mlmodel" . 2>&1 | tee "/tmp/$name.log"
+            if [ "${PIPESTATUS[0]}" -ne 0 ] || grep -qi "error" "/tmp/$name.log"; then
+              echo "ERROR: coremlcompiler failed for $name"; exit 1
+            fi
+            test -d "$name.mlmodelc" || { echo "ERROR: $name.mlmodelc was not produced"; exit 1; }
+            du -sh "$name.mlmodelc"
+          done
 
-          test -d SwipeAnnotator.mlmodelc || { echo "ERROR: SwipeAnnotator.mlmodelc was not produced"; exit 1; }
-          echo "Model compiled:"
-          du -sh SwipeAnnotator.mlmodelc
-
-          # Load-back sanity check: confirms the *source* SwipeAnnotator.mlmodel
-          # is valid and produces sane output shapes, via one dummy forward pass.
-          #
-          # Deliberately loads SwipeAnnotator.mlmodel here, NOT the compiled
-          # SwipeAnnotator.mlmodelc from the step above. ct.models.MLModel()
-          # loads a path via coremltools' package/manifest logic, which expects
-          # either a plain .mlmodel file or an ML-Program .mlpackage bundle --
-          # an already-AOT-compiled .mlmodelc (this script's "neuralnetwork"/
-          # Espresso format) never contains a Manifest.json, so pointing
-          # MLModel() at it always raises "A valid manifest does not exist",
-          # even when the .mlmodelc is completely fine. That's a Python-loader
-          # limitation, not evidence of a broken compile -- the .mlmodelc is
-          # exactly what ships to Sideloadly and is what device runtime
-          # (AIPlayer.xm) loads directly via the MLModel API, which does not
-          # have this restriction.
-          #
-          # Shapes below mirror --img_size 128 above and AIPlayer.xm's
-          # kHidden/kFastLayers/kSlowLayers constants (192/2/1, so
-          # slow_hidden = 192/2 = 96). If you change the architecture or
-          # img_size, update both this block and the matching constants in
-          # AIPlayer.xm together.
-          python3 - << 'PYEOF'
-          import coremltools as ct
-          import numpy as np
-
-          m = ct.models.MLModel("SwipeAnnotator.mlmodel")
-          spec = m.get_spec()
-          print(f"Loaded OK. {len(spec.description.input)} inputs, {len(spec.description.output)} outputs.")
-
-          img = 128
-          inputs = {
-              "fast_frame": np.zeros((1, 2, img, img), dtype=np.float32),
-              "slow_frame": np.zeros((1, 2, img, img), dtype=np.float32),
-              "has_slow":   np.zeros((1,), dtype=np.float32),
-              "h_fast_in":  np.zeros((2, 1, 192), dtype=np.float32),
-              "h_slow_in":  np.zeros((1, 1, 96), dtype=np.float32),
-          }
-          out = m.predict(inputs)
-          for k, v in out.items():
-              print(f"  {k}: shape={np.array(v).shape}")
-          print("Dummy forward pass succeeded.")
-          PYEOF
-
-      # ── Build the dylibs ─────────────────────────────────────────────────
-      # No dpkg-deb, ldid, or fakeroot needed anymore: these are plain
-      # `library` instances (LIBRARY_NAME = TouchSynthesis AIPlayer in the
-      # root Makefile), not `tweak` targets, so there's no .deb to package
-      # and no ad-hoc signing step to fake root ownership for. `make` alone
-      # produces two unsigned arm64 dylibs -- TouchSynthesis (the touch-
-      # synthesis module) built first, then AIPlayer (links against it).
-      # Sideloadly does its own signing when it injects and installs both.
-      - name: Build dylibs
+      - name: Build dylib
         run: |
           set -euo pipefail
           make clean || true
@@ -157,56 +93,31 @@ jobs:
         id: find_dylib
         run: |
           set -euo pipefail
-          # Both instances land in this repo root's .theos/obj/arm64/ --
-          # confirmed Theos behavior (see root Makefile's header comment).
-          TOUCHSYNTH_PATH=".theos/obj/arm64/TouchSynthesis.dylib"
-          AIPLAYER_PATH=".theos/obj/arm64/AIPlayer.dylib"
-          for p in "$TOUCHSYNTH_PATH" "$AIPLAYER_PATH"; do
-            if [ ! -f "$p" ]; then
-              echo "ERROR: $p not found. Check the 'Build dylibs' step log above."
-              exit 1
-            fi
-          done
-          echo "touchsynthesis_path=$TOUCHSYNTH_PATH" >> "$GITHUB_OUTPUT"
-          echo "dylib_path=$AIPLAYER_PATH" >> "$GITHUB_OUTPUT"
+          DYLIB_PATH=".theos/obj/arm64/AIPlayer.dylib"
+          if [ ! -f "$DYLIB_PATH" ]; then
+            echo "ERROR: $DYLIB_PATH not found. Check the 'Build dylib' step log above."
+            exit 1
+          fi
+          echo "dylib_path=$DYLIB_PATH" >> "$GITHUB_OUTPUT"
 
-      - name: Upload AIPlayer dylib
+      - name: Upload dylib
         uses: actions/upload-artifact@v4
         with:
           name: AIPlayer-dylib
           path: ${{ steps.find_dylib.outputs.dylib_path }}
           if-no-files-found: error
 
-      - name: Upload TouchSynthesis dylib
-        uses: actions/upload-artifact@v4
-        with:
-          name: TouchSynthesis-dylib
-          path: ${{ steps.find_dylib.outputs.touchsynthesis_path }}
-          if-no-files-found: error
-
-      # ── Sideloadly deployment artifact ───────────────────────────────────
-      # Zip, don't tar: this is meant to be unzipped by hand on macOS/Windows
-      # before dragging the resulting SwipeAnnotator.mlmodelc folder into
-      # Sideloadly alongside AIPlayer.dylib AND TouchSynthesis.dylib (both
-      # dylibs must be injected together now -- AIPlayer.dylib depends on
-      # TouchSynthesis.dylib at load time). Zipping it ourselves first keeps
-      # SwipeAnnotator.mlmodelc's internal directory structure intact as a
-      # single nameable download, rather than relying on the double-zip
-      # actions/upload-artifact would otherwise produce from a bare folder.
-      - name: Package Core ML model for Sideloadly
+      # Both compiled models in one zip. Unzip, then drag BOTH .mlmodelc
+      # folders into Sideloadly next to AIPlayer.dylib.
+      - name: Package Core ML models for Sideloadly
         run: |
           set -euo pipefail
-          test -d SwipeAnnotator.mlmodelc || {
-            echo "ERROR: SwipeAnnotator.mlmodelc missing -- did the 'Convert checkpoint to Core ML' step run?"
-            exit 1
-          }
-          zip -r SwipeAnnotator.mlmodelc.zip SwipeAnnotator.mlmodelc
-          echo "Zipped for Sideloadly:"
-          unzip -l SwipeAnnotator.mlmodelc.zip | head -20
+          zip -r AIPlayerModels.zip SwipeEncoder.mlmodelc SwipeHead.mlmodelc
+          unzip -l AIPlayerModels.zip | head -30
 
-      - name: Upload Core ML model (for Sideloadly injection)
+      - name: Upload Core ML models (for Sideloadly injection)
         uses: actions/upload-artifact@v4
         with:
-          name: SwipeAnnotator-mlmodelc
-          path: SwipeAnnotator.mlmodelc.zip
+          name: AIPlayer-models
+          path: AIPlayerModels.zip
           if-no-files-found: error
