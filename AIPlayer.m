@@ -1,34 +1,20 @@
 // =============================================================================
 // AIPlayer.m — sideloaded screen-capture + Core ML swipe player.
 //
-// Pipeline, once per 24 Hz tick:
+//   ReplayKit frame
+//     -> fixed-rate tick clock (tick_hz)
+//     -> exact training preprocessing (AIPreprocess.c): antialiased 128x128
+//        resize + torchvision grayscale, NO colour management
+//     -> model ("simple": one frame; "causal": cached CNN features + GRU head)
+//     -> detection gate (fire once per burst) -> synthesized swipe
 //
-//   ReplayKit frame -> fixed-rate clock -> antialiased 128x128 resize
-//     -> gray + diff -> SwipeEncoder (CNN)     -> 128-d feature, cached in a ring
-//     -> last 8 / 2 features -> SwipeHead (GRU) -> det prob + direction
-//     -> detection gate -> synthesized swipe on the game window
+// Everything model-specific comes from AIPlayerConfig.json, written by
+// convert_to_coreml.py next to the compiled models. The dylib therefore cannot
+// run a model with the wrong pipeline, and thresholds can be tuned without a
+// rebuild.
 //
-// TRAIN / DEPLOY PARITY
-//   The checkpoint was trained and validated on windows evaluated from a ZERO
-//   hidden state (8 fast frames [t-7..t] + 2 slow frames [t-19, t-13]).
-//   Carrying GRU state across a whole session is a different function that was
-//   never validated. This file therefore caches per-frame CNN features and
-//   re-runs the windowed head every tick, which reproduces training exactly.
-//   See convert_to_coreml.py for the exported I/O contract.
-//
-// PREPROCESSING CONTRACT (must match the dataset builder)
-//   1. Square-stretch resize to 128x128 with an antialiased filter
-//      (training used torchvision resize with antialias=True; a plain
-//      bilinear point-sample aliases and fabricates motion in the diff channel).
-//   2. Gray = 0.2989 R + 0.5870 G + 0.1140 B (ITU-R 601-2).
-//   3. diff = clamp(floorDiv((gray[t] - gray[t-1]) * 127, 255) + 127, 0, 255);
-//      the first frame's diff is neutral (127).
-//   4. Raw 0..255 float32 into the model; it divides by 255 internally.
-//   5. Frames are resampled onto a fixed 24 Hz clock (sample-and-hold when the
-//      source skips frames), because the diff channel is rate dependent.
-//
-// Deployment: non-jailbroken, injected with Sideloadly next to the two
-// compiled models (SwipeEncoder.mlmodelc, SwipeHead.mlmodelc).
+// Deployment: non-jailbroken, injected with Sideloadly. Put AIPlayerConfig.json
+// and the .mlmodelc folder(s) it lists next to AIPlayer.dylib.
 // =============================================================================
 
 #import <UIKit/UIKit.h>
@@ -37,6 +23,7 @@
 #import <CoreML/CoreML.h>
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
+#import <ImageIO/ImageIO.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #include <mach-o/dyld.h>
@@ -44,46 +31,23 @@
 #include <os/log.h>
 #include <stdatomic.h>
 
-// =============================================================================
-// MARK: - Configuration
-// =============================================================================
+#include "AIPreprocess.h"
 
-// Must match the checkpoint / dataset. Enums (not static const) so they can
-// size C arrays.
-enum {
-    AIImgSize  = 128,                     // H = W of the model input
-    AIPixels   = AIImgSize * AIImgSize,
-    AIFeatDim  = 128,                     // encoder output width
-    AIFastLen  = 8,                       // fast window: frames [t-7 .. t]
-    AISlowLen  = 2,                       // slow samples
-    AIHistory  = 20,                      // newest frame + 19 back (= max slow offset + 1)
-};
-static const NSInteger kSlowOffsets[AISlowLen] = { 19, 13 };   // frames behind t, oldest first
+static NSString *const kConfigFileName = @"AIPlayerConfig.json";
 
-static NSString *const kEncoderModelName = @"SwipeEncoder.mlmodelc";
-static NSString *const kHeadModelName    = @"SwipeHead.mlmodelc";
-
-// Fixed-rate clock (training stream was 24 fps).
-static const CFTimeInterval kTickInterval     = 1.0 / 24.0;
-static const CFTimeInterval kTickTolerance    = 0.008;   // accept a frame this early (60 Hz jitter)
-static const NSInteger      kMaxCatchUpTicks  = 3;       // longer gaps are treated as a discontinuity
-
-// Detection gate. det_threshold was 0.6 in training; training also used
-// pos_weight=8, which inflates probabilities, so the fire threshold is higher.
-static const float kFireThreshold    = 0.80f;   // fire when prob >= this and the gate is armed
-static const float kReleaseThreshold = 0.50f;   // re-arm once prob drops below this
-static const float kMinDirConfidence = 0.30f;   // training dir_threshold
-static const CFTimeInterval kInjectCooldown = 0.15;
-
-// Synthesized swipe.
+// Synthesized swipe geometry (game-specific, not model-specific).
 static const NSTimeInterval kSwipeDuration  = 0.12;
 static const NSInteger      kSwipeSteps     = 15;
-static const NSTimeInterval kSwipeEndDelay  = 0.016;    // one frame between last move and lift
-static const CGFloat        kSwipeMagnitude = 0.35;     // fraction of min(window w, h)
+static const NSTimeInterval kSwipeEndDelay  = 0.016;   // one frame between last move and lift
+static const CGFloat        kSwipeMagnitude = 0.35;    // fraction of min(window w, h)
 
-// Layer B (sendEvent:) alone was empirically swallowed on the target device/iOS
-// build, so touches are also delivered straight to the hit-tested view. If a
-// build ever delivers both, every touch phase fires twice — set this to 0.
+// Clock: accept a frame slightly early (60 Hz jitter); longer gaps are a discontinuity.
+static const CFTimeInterval kTickTolerance   = 0.008;
+static const NSInteger      kMaxCatchUpTicks = 3;
+
+// sendEvent: alone was empirically swallowed on the target build, so touches are
+// also delivered straight to the hit-tested view. If a build ever delivers both,
+// every touch phase fires twice — set this to 0.
 #define AI_DELIVER_DIRECTLY_TO_VIEW 1
 
 typedef NS_ENUM(NSInteger, AISwipeDirection) {
@@ -95,9 +59,10 @@ typedef NS_ENUM(NSInteger, AIPlayerState) {
 };
 
 typedef struct {
-    float           detProbability;
+    float            detProbability;
+    float            dirProbs[4];       // UP, DOWN, LEFT, RIGHT
     AISwipeDirection direction;
-    float           dirConfidence;
+    float            dirConfidence;
 } AIPrediction;
 
 // =============================================================================
@@ -127,8 +92,7 @@ static UIWindowScene *AIActiveWindowScene(void) {
     return fallback;
 }
 
-// The game's key window. The overlay window can never become key, so it is
-// never returned here.
+// The game's key window (the overlay window can never become key).
 static UIWindow *AIKeyWindow(void) {
     for (UIScene *scene in [UIApplication sharedApplication].connectedScenes) {
         if (scene.activationState != UISceneActivationStateForegroundActive) continue;
@@ -137,15 +101,12 @@ static UIWindow *AIKeyWindow(void) {
             if (window.isKeyWindow) return window;
         }
     }
-    // Apps without a scene manifest have no connected scenes.
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
-    return [UIApplication sharedApplication].keyWindow;
+    return [UIApplication sharedApplication].keyWindow;    // apps without a scene manifest
 #pragma clang diagnostic pop
 }
 
-// MLMultiArray raw access. dataPointer is deprecated from iOS 15.4 but remains
-// the simplest correct access for arrays this code allocates itself.
 static inline void *AIArrayData(MLMultiArray *array) {
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
@@ -153,8 +114,7 @@ static inline void *AIArrayData(MLMultiArray *array) {
 #pragma clang diagnostic pop
 }
 
-// Copies the first `n` elements of a 1-D-like output (honouring the innermost
-// stride, which Core ML may pad) into `dst`.
+// Copies the first `n` elements of a 1-D-like output, honouring the innermost stride.
 static BOOL AICopyVector(MLMultiArray *array, float *dst, NSInteger n) {
     if (!array || array.count < n) return NO;
     NSInteger stride = array.strides.lastObject.integerValue;
@@ -170,14 +130,13 @@ static BOOL AICopyVector(MLMultiArray *array, float *dst, NSInteger n) {
             for (NSInteger i = 0; i < n; i++) dst[i] = (float)p[i * stride];
             return YES;
         }
-        default:   // e.g. Float16: slow but always correct (flat logical index)
+        default:
             for (NSInteger i = 0; i < n; i++) dst[i] = array[i].floatValue;
             return YES;
     }
 }
 
-// Writes `n` floats into a freshly allocated (contiguous) input array, honouring
-// whichever dtype the model declared (classic neuralnetwork models may use Double).
+// Writes `n` floats into an input array this file allocated (contiguous).
 static void AIFillArray(MLMultiArray *array, const float *src, NSInteger n) {
     void *dst = AIArrayData(array);
     if (array.dataType == MLMultiArrayDataTypeDouble) {
@@ -188,20 +147,69 @@ static void AIFillArray(MLMultiArray *array, const float *src, NSInteger n) {
     }
 }
 
-static MLMultiArrayDataType AIDeclaredInputType(MLModel *model, NSString *name) {
-    MLMultiArrayDataType type = model.modelDescription.inputDescriptionsByName[name].multiArrayConstraint.dataType;
-    return type == MLMultiArrayDataTypeDouble ? MLMultiArrayDataTypeDouble : MLMultiArrayDataTypeFloat32;
+// Allocates an input array of exactly the shape the model declares, or fails.
+static MLMultiArray *AIInputArray(MLModel *model, NSString *name, NSArray<NSNumber *> *shape,
+                                  NSError **error) {
+    MLMultiArrayConstraint *c = model.modelDescription.inputDescriptionsByName[name].multiArrayConstraint;
+    if (!c) {
+        if (error) *error = AIError(10, [NSString stringWithFormat:@"model has no multi-array input '%@'", name]);
+        return nil;
+    }
+    if (![c.shape isEqualToArray:shape]) {
+        if (error) *error = AIError(11, [NSString stringWithFormat:
+            @"input '%@' has shape %@, config expects %@ (model and AIPlayerConfig.json are from different exports)",
+            name, c.shape, shape]);
+        return nil;
+    }
+    MLMultiArrayDataType type = c.dataType == MLMultiArrayDataTypeDouble ? MLMultiArrayDataTypeDouble
+                                                                          : MLMultiArrayDataTypeFloat32;
+    return [[MLMultiArray alloc] initWithShape:shape dataType:type error:error];
 }
 
-static inline int AIFloorDiv(int a, int b) {
-    int q = a / b, r = a % b;
-    if (r != 0 && ((r < 0) != (b < 0))) q--;
-    return q;
+static BOOL AIHasOutputs(MLModel *model, NSArray<NSString *> *names, NSError **error) {
+    for (NSString *name in names) {
+        if (!model.modelDescription.outputDescriptionsByName[name]) {
+            if (error) *error = AIError(12, [NSString stringWithFormat:@"model has no output '%@'", name]);
+            return NO;
+        }
+    }
+    return YES;
+}
+
+static void AIFillPrediction(float detLogit, const float dirLogits[4], AIPrediction *out) {
+    float m = fmaxf(fmaxf(dirLogits[0], dirLogits[1]), fmaxf(dirLogits[2], dirLogits[3]));
+    float sum = 0;
+    for (int i = 0; i < 4; i++) { out->dirProbs[i] = expf(dirLogits[i] - m); sum += out->dirProbs[i]; }
+    int best = 0;
+    for (int i = 0; i < 4; i++) {
+        out->dirProbs[i] /= sum;
+        if (out->dirProbs[i] > out->dirProbs[best]) best = i;
+    }
+    out->detProbability = 1.0f / (1.0f + expf(-detLogit));
+    out->direction      = (AISwipeDirection)best;
+    out->dirConfidence  = out->dirProbs[best];
 }
 
 // =============================================================================
-// MARK: - Model location
+// MARK: - Configuration (AIPlayerConfig.json)
 // =============================================================================
+
+@interface AIConfig : NSObject
+@property (nonatomic, readonly) NSURL *directory;
+@property (nonatomic, readonly) NSDictionary *raw;
+@property (nonatomic, readonly) BOOL causal;
+@property (nonatomic, readonly) NSArray<NSString *> *modelFiles;
+@property (nonatomic, readonly) NSInteger imgSize;
+@property (nonatomic, readonly) double tickHz;
+@property (nonatomic, readonly) float fireThreshold, releaseThreshold, minDirConfidence;
+@property (nonatomic, readonly) double cooldown;
+@property (nonatomic, readonly) float inputGain, inputBias;
+@property (nonatomic, readonly) NSInteger debugDumpFrames;
+@property (nonatomic, readonly) MLComputeUnits computeUnits;
+@property (nonatomic, readonly) NSInteger fastLen, featDim;          // causal only
+@property (nonatomic, readonly) NSArray<NSNumber *> *slowOffsets;    // causal only, oldest first
++ (nullable instancetype)locateAndLoad:(NSError **)error;
+@end
 
 static NSString *AIDylibDirectory(void) {
     NSString *loose = nil;
@@ -219,29 +227,25 @@ static NSString *AIDylibDirectory(void) {
     return loose;
 }
 
-// Depth-limited search for a directory called `name` (fallback only).
-static NSString *AIFindDirectoryNamed(NSString *name, NSString *root, NSInteger maxDepth) {
+// Depth-limited search for a file called `name` (fallback only).
+static NSString *AIFindFileNamed(NSString *name, NSString *root, NSInteger maxDepth) {
     NSFileManager *fm = [NSFileManager defaultManager];
     BOOL isDir = NO;
     if (![fm fileExistsAtPath:root isDirectory:&isDir] || !isDir) return nil;
-
     NSDirectoryEnumerator<NSURL *> *walker =
         [fm enumeratorAtURL:[NSURL fileURLWithPath:root isDirectory:YES]
- includingPropertiesForKeys:@[NSURLIsDirectoryKey]
+ includingPropertiesForKeys:nil
                     options:NSDirectoryEnumerationSkipsHiddenFiles
                errorHandler:^BOOL(NSURL *url, NSError *error) { return YES; }];
     NSInteger rootDepth = root.pathComponents.count;
     for (NSURL *url in walker) {
         if ((NSInteger)url.pathComponents.count - rootDepth > maxDepth) { [walker skipDescendants]; continue; }
-        NSNumber *flag = nil;
-        [url getResourceValue:&flag forKey:NSURLIsDirectoryKey error:nil];
-        if (flag.boolValue && [url.lastPathComponent isEqualToString:name]) return url.path;
+        if ([url.lastPathComponent isEqualToString:name]) return url.path;
     }
     return nil;
 }
 
-// Directory that contains BOTH compiled models, or nil.
-static NSURL *AIFindModelDirectory(void) {
+static NSString *AIFindConfigDirectory(void) {
     NSFileManager *fm = [NSFileManager defaultManager];
     NSString *dylibDir  = AIDylibDirectory();
     NSString *bundleDir = [NSBundle mainBundle].bundlePath;
@@ -254,165 +258,232 @@ static NSURL *AIFindModelDirectory(void) {
     if (bundleDir) {
         [bases addObject:bundleDir];
         [bases addObject:[bundleDir stringByAppendingPathComponent:@"Frameworks"]];
-        [bases addObject:[[bundleDir stringByAppendingPathComponent:@"Frameworks"]
-                          stringByAppendingPathComponent:@"AIPlayer.bundle"]];
+        [bases addObject:[bundleDir stringByAppendingPathComponent:@"Frameworks/AIPlayer.bundle"]];
     }
-
-    BOOL (^hasBoth)(NSString *) = ^BOOL(NSString *dir) {
-        return [fm fileExistsAtPath:[dir stringByAppendingPathComponent:kEncoderModelName]] &&
-               [fm fileExistsAtPath:[dir stringByAppendingPathComponent:kHeadModelName]];
-    };
     for (NSString *base in bases) {
-        if (hasBoth(base)) return [NSURL fileURLWithPath:base isDirectory:YES];
+        if ([fm fileExistsAtPath:[base stringByAppendingPathComponent:kConfigFileName]]) return base;
     }
-    if (bundleDir) {
-        NSString *encoder = AIFindDirectoryNamed(kEncoderModelName, bundleDir, 4);
-        NSString *parent = [encoder stringByDeletingLastPathComponent];
-        if (parent && hasBoth(parent)) return [NSURL fileURLWithPath:parent isDirectory:YES];
-    }
-    AILog("Models not found. Inject %{public}@ and %{public}@ next to AIPlayer.dylib "
-          "(searched dylib dir %{public}@, app bundle %{public}@).",
-          kEncoderModelName, kHeadModelName, dylibDir ?: @"(nil)", bundleDir ?: @"(nil)");
+    NSString *found = bundleDir ? AIFindFileNamed(kConfigFileName, bundleDir, 4) : nil;
+    if (found) return [found stringByDeletingLastPathComponent];
+    AILog("%{public}@ not found (searched dylib dir %{public}@ and app bundle %{public}@). "
+          "Inject it and the .mlmodelc folders next to AIPlayer.dylib.",
+          kConfigFileName, dylibDir ?: @"(nil)", bundleDir ?: @"(nil)");
     return nil;
 }
+
+@implementation AIConfig
+
+static double AINum(NSDictionary *d, NSString *key, double fallback) {
+    id v = d[key];
+    return [v isKindOfClass:[NSNumber class]] ? [v doubleValue] : fallback;
+}
+
++ (instancetype)locateAndLoad:(NSError **)error {
+    NSString *dir = AIFindConfigDirectory();
+    if (!dir) {
+        if (error) *error = AIError(1, @"AIPlayerConfig.json not found");
+        return nil;
+    }
+    NSData *data = [NSData dataWithContentsOfFile:[dir stringByAppendingPathComponent:kConfigFileName]];
+    NSDictionary *json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:error] : nil;
+    if (![json isKindOfClass:[NSDictionary class]]) {
+        if (error && !*error) *error = AIError(2, @"AIPlayerConfig.json is not a JSON object");
+        return nil;
+    }
+    AIConfig *c = [AIConfig new];
+    if (![c _parse:json directory:[NSURL fileURLWithPath:dir isDirectory:YES] error:error]) return nil;
+    return c;
+}
+
+- (BOOL)_parse:(NSDictionary *)j directory:(NSURL *)dir error:(NSError **)error {
+    _directory = dir;
+    _raw = j;
+
+    id type = j[@"model_type"];
+    if ([type isEqual:@"causal"]) _causal = YES;
+    else if (![type isEqual:@"simple"]) {
+        if (error) *error = AIError(3, [NSString stringWithFormat:@"unknown model_type '%@'", type]);
+        return NO;
+    }
+    NSArray *models = j[@"models"];
+    BOOL modelsOK = [models isKindOfClass:[NSArray class]] && models.count == (_causal ? 2u : 1u);
+    for (id name in modelsOK ? models : @[]) modelsOK = modelsOK && [name isKindOfClass:[NSString class]];
+    if (!modelsOK) {
+        if (error) *error = AIError(4, @"'models' must list 1 (simple) or 2 (causal: encoder, head) .mlmodelc names");
+        return NO;
+    }
+    _modelFiles = models;
+
+    _imgSize          = (NSInteger)AINum(j, @"img_size", 128);
+    _tickHz           = AINum(j, @"tick_hz", 24);
+    _fireThreshold    = (float)AINum(j, @"fire_threshold", 0.6);
+    _releaseThreshold = (float)AINum(j, @"release_threshold", _fireThreshold * 0.5);
+    _minDirConfidence = (float)AINum(j, @"min_dir_confidence", 0);
+    _cooldown         = AINum(j, @"cooldown_s", 0.25);
+    _inputGain        = (float)AINum(j, @"input_gain", 1);
+    _inputBias        = (float)AINum(j, @"input_bias", 0);
+    _debugDumpFrames  = (NSInteger)AINum(j, @"debug_dump_frames", 0);
+
+    NSString *units = j[@"compute_units"];
+    _computeUnits = [units isEqualToString:@"cpu_only"]    ? MLComputeUnitsCPUOnly
+                  : [units isEqualToString:@"cpu_and_gpu"] ? MLComputeUnitsCPUAndGPU
+                                                           : MLComputeUnitsAll;
+
+    if (_imgSize < 8 || _imgSize > 1024 || _tickHz < 1 || _tickHz > 120 ||
+        _releaseThreshold > _fireThreshold) {
+        if (error) *error = AIError(5, @"AIPlayerConfig.json values out of range "
+                                        "(img_size, tick_hz, or release_threshold > fire_threshold)");
+        return NO;
+    }
+
+    if (_causal) {
+        _fastLen = (NSInteger)AINum(j, @"fast_len", 8);
+        _featDim = (NSInteger)AINum(j, @"feat_dim", 128);
+        NSArray *slow = j[@"slow_offsets"];
+        _slowOffsets = [slow isKindOfClass:[NSArray class]] ? slow : @[@19, @13];
+        BOOL slowOK = _slowOffsets.count >= 1;
+        for (id o in _slowOffsets) slowOK = slowOK && [o isKindOfClass:[NSNumber class]] && [o integerValue] >= 0;
+        if (_fastLen < 1 || _featDim < 1 || !slowOK) {
+            if (error) *error = AIError(6, @"invalid causal settings in AIPlayerConfig.json");
+            return NO;
+        }
+    }
+    return YES;
+}
+
+@end
 
 // =============================================================================
 // MARK: - Inference engine
 //
-// Not thread safe by itself; every public method takes an internal lock.
+// Owns preprocessing and the Core ML models. Every public method takes the lock.
 // =============================================================================
 
 @interface AIInferenceEngine : NSObject
-@property (nonatomic, readonly) BOOL isLoaded;
-@property (nonatomic, readonly) double lastInferenceMs;
-- (BOOL)loadModelsFromDirectory:(NSURL *)directory error:(NSError **)error;
+- (nullable instancetype)initWithConfig:(AIConfig *)config error:(NSError **)error;
 - (void)resetSession;
-// Real frame: preprocess + encode. Returns YES and fills `out` once the history
-// is full (the first 20 ticks only warm the feature ring).
-- (BOOL)ingestFrame:(CVPixelBufferRef)pixelBuffer prediction:(AIPrediction *)out;
-// Source skipped a tick: re-feed the previous frame with a neutral diff so the
-// feature ring stays aligned with the 24 Hz timeline.
+// A real frame for this tick. Returns YES and fills `out` when a prediction is available
+// (the causal model needs `history` ticks to warm up).
+- (BOOL)ingestFrame:(CVPixelBufferRef)pixelBuffer orientation:(CGImagePropertyOrientation)orientation
+         prediction:(AIPrediction *)out;
+// The source skipped this tick: repeat the previous frame (identical frame => neutral diff),
+// keeping the causal feature ring on the training clock. No-op for the simple model.
 - (void)ingestHeldFrame;
+// The model input of the most recent tick (img_size^2 uint8), for debug dumps.
+- (void)copyLastGray:(uint8_t *)dst;
+@property (nonatomic, readonly) double lastInferenceMs;
 @end
 
-static BOOL AIValidateModel(MLModel *model, NSString *label,
-                            NSArray<NSString *> *inputs, NSArray<NSString *> *outputs,
-                            NSError **error) {
-    MLModelDescription *desc = model.modelDescription;
-    for (NSString *name in inputs) {
-        MLFeatureDescription *f = desc.inputDescriptionsByName[name];
-        if (!f || !f.multiArrayConstraint) {
-            if (error) *error = AIError(2, [NSString stringWithFormat:
-                @"%@ is missing multi-array input '%@' (stale model from an older export?)", label, name]);
-            return NO;
-        }
-    }
-    for (NSString *name in outputs) {
-        if (!desc.outputDescriptionsByName[name]) {
-            if (error) *error = AIError(3, [NSString stringWithFormat:
-                @"%@ is missing output '%@' (stale model from an older export?)", label, name]);
-            return NO;
-        }
-    }
-    return YES;
-}
-
 @implementation AIInferenceEngine {
-    NSLock *_lock;
+    NSLock   *_lock;
+    AIConfig *_cfg;
+    NSInteger _S, _pixels;
 
-    MLModel *_encoder, *_head;
-    MLMultiArray *_encIn, *_headFast, *_headSlow;          // reused every tick
-    id<MLFeatureProvider> _encProvider, _headProvider;
+    // simple: _model only. causal: _model = encoder, _head = head.
+    MLModel *_model, *_head;
+    MLMultiArray *_in, *_headFast, *_headSlow;
+    id<MLFeatureProvider> _provider, _headProvider;
 
-    CIContext *_ci;
-    CGColorSpaceRef _rgb;
+    // preprocessing
+    CIContext  *_ci;
+    uint8_t    *_rgba;  size_t _rgbaCapacity;
+    AIResampler _resampler;  int _rsW, _rsH;  BOOL _hasResampler;
+    uint8_t     _lut[256];                     // input_gain / input_bias, applied to gray
+    uint8_t    *_gray, *_prevGray;
+    BOOL        _hasPrev;
+    float      *_stage;                        // model input staging (float32)
 
-    float   _encBuf[2 * AIPixels];                         // [gray | diff], staged as float32
-    float   _fastBuf[AIFastLen * AIFeatDim];
-    float   _slowBuf[AISlowLen * AIFeatDim];
-
-    uint8_t _rgba[AIPixels * 4];
-    uint8_t _gray[AIPixels];
-    uint8_t _prevGray[AIPixels];
-    BOOL    _hasPrev;
-    uint8_t _diffLUT[511];                                 // index = gray delta + 255
-
-    float     _ring[AIHistory][AIFeatDim];                 // per-tick encoder features
-    NSInteger _tick;                                       // ticks pushed this session
+    // causal feature ring
+    NSInteger _history, _tick;
+    float    *_ring, *_fastBuf, *_slowBuf;
 
     double _lastInferenceMs;
 }
 
-- (instancetype)init {
-    if ((self = [super init])) {
-        _lock = [NSLock new];
-        _rgb = CGColorSpaceCreateDeviceRGB();
-        _ci = [CIContext contextWithOptions:@{ kCIContextWorkingColorSpace: (__bridge id)_rgb }];
-        for (int d = -255; d <= 255; d++) {
-            int s = AIFloorDiv(d * 127, 255) + 127;
-            _diffLUT[d + 255] = (uint8_t)(s < 0 ? 0 : (s > 255 ? 255 : s));
-        }
+- (instancetype)initWithConfig:(AIConfig *)config error:(NSError **)error {
+    if (!(self = [super init])) return nil;
+    _lock = [NSLock new];
+    _cfg = config;
+    _S = config.imgSize;
+    _pixels = _S * _S;
+
+    // No colour management anywhere: the training decoder (FFmpeg/NVDEC) converted
+    // YUV->RGB and nothing else, so CoreImage must not apply transfer-function or
+    // gamut conversions either.
+    _ci = [CIContext contextWithOptions:@{ kCIContextWorkingColorSpace: [NSNull null],
+                                           kCIContextOutputColorSpace:  [NSNull null] }];
+
+    for (int v = 0; v < 256; v++) {
+        float x = roundf(v * config.inputGain + config.inputBias);
+        _lut[v] = (uint8_t)(x < 0 ? 0 : (x > 255 ? 255 : x));
     }
+
+    _gray     = calloc((size_t)_pixels, 1);
+    _prevGray = calloc((size_t)_pixels, 1);
+    _stage    = calloc((size_t)_pixels * (config.causal ? 2 : 1), sizeof(float));
+    if (!_gray || !_prevGray || !_stage) {
+        if (error) *error = AIError(20, @"out of memory");
+        return nil;
+    }
+    if (![self _loadModels:error]) return nil;
+    [self _resetLocked];
+    AILog("Loaded %{public}@ model from %{public}@ (img %ld, %.0f Hz, fire %.2f / release %.2f)",
+          config.causal ? @"causal" : @"simple", config.directory.path, (long)_S, config.tickHz,
+          config.fireThreshold, config.releaseThreshold);
     return self;
 }
 
 - (void)dealloc {
-    if (_rgb) CGColorSpaceRelease(_rgb);
+    if (_hasResampler) AIResamplerFree(&_resampler);
+    free(_rgba); free(_gray); free(_prevGray); free(_stage);
+    free(_ring); free(_fastBuf); free(_slowBuf);
 }
 
-- (BOOL)isLoaded { return _encoder != nil && _head != nil; }
 - (double)lastInferenceMs { return _lastInferenceMs; }
 
-// ── loading ─────────────────────────────────────────────────────────────────
-
-- (BOOL)loadModelsFromDirectory:(NSURL *)directory error:(NSError **)error {
-    [_lock lock];
-    BOOL ok = [self _loadLocked:directory error:error];
-    [_lock unlock];
-    return ok;
+- (MLModel *)_open:(NSString *)file error:(NSError **)error {
+    MLModelConfiguration *mc = [MLModelConfiguration new];
+    mc.computeUnits = _cfg.computeUnits;
+    return [MLModel modelWithContentsOfURL:[_cfg.directory URLByAppendingPathComponent:file isDirectory:YES]
+                             configuration:mc error:error];
 }
 
-- (BOOL)_loadLocked:(NSURL *)directory error:(NSError **)error {
-    MLModelConfiguration *config = [MLModelConfiguration new];
-    config.computeUnits = MLComputeUnitsAll;
+- (BOOL)_loadModels:(NSError **)error {
+    NSArray<NSNumber *> *frameShape = @[@1, @(_cfg.causal ? 2 : 1), @(_S), @(_S)];
+    _model = [self _open:_cfg.modelFiles[0] error:error];
+    if (!_model) return NO;
+    _in = AIInputArray(_model, @"frame", frameShape, error);
+    if (!_in) return NO;
+    _provider = [[MLDictionaryFeatureProvider alloc]
+        initWithDictionary:@{ @"frame": [MLFeatureValue featureValueWithMultiArray:_in] } error:error];
+    if (!_provider) return NO;
 
-    MLModel *encoder = [MLModel modelWithContentsOfURL:
-        [directory URLByAppendingPathComponent:kEncoderModelName isDirectory:YES]
-                                         configuration:config error:error];
-    if (!encoder) return NO;
-    MLModel *head = [MLModel modelWithContentsOfURL:
-        [directory URLByAppendingPathComponent:kHeadModelName isDirectory:YES]
-                                       configuration:config error:error];
-    if (!head) return NO;
+    if (!_cfg.causal) return AIHasOutputs(_model, @[@"det_logit", @"dir_logits"], error);
 
-    if (!AIValidateModel(encoder, @"SwipeEncoder", @[@"frame"], @[@"feat"], error)) return NO;
-    if (!AIValidateModel(head, @"SwipeHead", @[@"fast_feats", @"slow_feats"],
-                         @[@"det_logit", @"dir_logits"], error)) return NO;
+    if (!AIHasOutputs(_model, @[@"feat"], error)) return NO;
+    _head = [self _open:_cfg.modelFiles[1] error:error];
+    if (!_head || !AIHasOutputs(_head, @[@"det_logit", @"dir_logits"], error)) return NO;
 
-    MLMultiArray *encIn = [[MLMultiArray alloc] initWithShape:@[@1, @2, @(AIImgSize), @(AIImgSize)]
-                                                     dataType:AIDeclaredInputType(encoder, @"frame") error:error];
-    MLMultiArray *fast  = [[MLMultiArray alloc] initWithShape:@[@1, @(AIFastLen), @(AIFeatDim)]
-                                                     dataType:AIDeclaredInputType(head, @"fast_feats") error:error];
-    MLMultiArray *slow  = [[MLMultiArray alloc] initWithShape:@[@1, @(AISlowLen), @(AIFeatDim)]
-                                                     dataType:AIDeclaredInputType(head, @"slow_feats") error:error];
-    if (!encIn || !fast || !slow) return NO;
+    NSInteger F = _cfg.fastLen, D = _cfg.featDim, K = (NSInteger)_cfg.slowOffsets.count;
+    _headFast = AIInputArray(_head, @"fast_feats", @[@1, @(F), @(D)], error);
+    _headSlow = AIInputArray(_head, @"slow_feats", @[@1, @(K), @(D)], error);
+    if (!_headFast || !_headSlow) return NO;
+    _headProvider = [[MLDictionaryFeatureProvider alloc] initWithDictionary:@{
+        @"fast_feats": [MLFeatureValue featureValueWithMultiArray:_headFast],
+        @"slow_feats": [MLFeatureValue featureValueWithMultiArray:_headSlow] } error:error];
+    if (!_headProvider) return NO;
 
-    id<MLFeatureProvider> encProvider = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"frame": [MLFeatureValue featureValueWithMultiArray:encIn] } error:error];
-    id<MLFeatureProvider> headProvider = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"fast_feats": [MLFeatureValue featureValueWithMultiArray:fast],
-                              @"slow_feats": [MLFeatureValue featureValueWithMultiArray:slow] } error:error];
-    if (!encProvider || !headProvider) return NO;
-
-    _encoder = encoder;  _head = head;
-    _encIn = encIn;      _headFast = fast;  _headSlow = slow;
-    _encProvider = encProvider;  _headProvider = headProvider;
-    [self _resetLocked];
-    AILog("Models loaded from %{public}@", directory.path);
+    _history = F;
+    for (NSNumber *o in _cfg.slowOffsets) _history = MAX(_history, o.integerValue + 1);
+    _ring    = calloc((size_t)(_history * D), sizeof(float));
+    _fastBuf = calloc((size_t)(F * D), sizeof(float));
+    _slowBuf = calloc((size_t)(K * D), sizeof(float));
+    if (!_ring || !_fastBuf || !_slowBuf) {
+        if (error) *error = AIError(20, @"out of memory");
+        return NO;
+    }
     return YES;
 }
-
-// ── session ─────────────────────────────────────────────────────────────────
 
 - (void)resetSession {
     [_lock lock];
@@ -423,140 +494,240 @@ static BOOL AIValidateModel(MLModel *model, NSString *label,
 - (void)_resetLocked {
     _tick = 0;
     _hasPrev = NO;
-    memset(_ring, 0, sizeof(_ring));
-    memset(_prevGray, 0, sizeof(_prevGray));
+    if (_ring) memset(_ring, 0, sizeof(float) * (size_t)(_history * _cfg.featDim));
+}
+
+- (void)copyLastGray:(uint8_t *)dst {
+    [_lock lock];
+    memcpy(dst, _gray, (size_t)_pixels);
+    [_lock unlock];
 }
 
 // ── per tick ────────────────────────────────────────────────────────────────
 
-- (BOOL)ingestFrame:(CVPixelBufferRef)pixelBuffer prediction:(AIPrediction *)out {
+- (BOOL)ingestFrame:(CVPixelBufferRef)pixelBuffer orientation:(CGImagePropertyOrientation)orientation
+         prediction:(AIPrediction *)out {
     [_lock lock];
     BOOL produced = NO;
-    if (self.isLoaded && [self _renderLocked:pixelBuffer]) {
-        CFTimeInterval t0 = CACurrentMediaTime();
-        [self _packLocked];
-        if ([self _encodeLocked]) produced = [self _predictLocked:out];
-        _lastInferenceMs = (CACurrentMediaTime() - t0) * 1000.0;
+    CFTimeInterval t0 = CACurrentMediaTime();
+    if ([self _preprocess:pixelBuffer orientation:orientation]) {
+        produced = _cfg.causal ? [self _causalStepHeld:NO prediction:out]
+                               : [self _simplePredict:out];
     }
+    _lastInferenceMs = (CACurrentMediaTime() - t0) * 1000.0;
     [_lock unlock];
     return produced;
 }
 
 - (void)ingestHeldFrame {
     [_lock lock];
-    if (self.isLoaded && _hasPrev) {
-        // Gray channel already holds the previous frame; identical frames
-        // have a neutral diff.
-        float *diff = _encBuf + AIPixels;
-        for (NSInteger i = 0; i < AIPixels; i++) diff[i] = 127.0f;
-        [self _encodeLocked];
-    }
+    if (_cfg.causal && _hasPrev) [self _causalStepHeld:YES prediction:NULL];
     [_lock unlock];
 }
 
-// Antialiased square-stretch resize into _rgba.
-- (BOOL)_renderLocked:(CVPixelBufferRef)pixelBuffer {
-    CIImage *image = [CIImage imageWithCVPixelBuffer:pixelBuffer];
-    CGRect extent = image.extent;
-    if (CGRectIsEmpty(extent)) return NO;
-    if (extent.origin.x != 0 || extent.origin.y != 0)
-        image = [image imageByApplyingTransform:
-                 CGAffineTransformMakeTranslation(-extent.origin.x, -extent.origin.y)];
+// Pixel buffer -> _gray, bit-exact with the dataset builder (see AIPreprocess.h).
+- (BOOL)_preprocess:(CVPixelBufferRef)pb orientation:(CGImagePropertyOrientation)orientation {
+    const uint8_t *pixels = NULL;
+    size_t w = 0, h = 0, rowBytes = 0;
+    int r = 0, g = 1, b = 2;
+    BOOL locked = NO;
 
-    // CILanczosScaleTransform: output height = scale * h, width = scale * aspect * w.
-    double scale  = (double)AIImgSize / extent.size.height;
-    double aspect = (double)extent.size.height / extent.size.width;
-    CIImage *scaled = [image imageByApplyingFilter:@"CILanczosScaleTransform"
-                               withInputParameters:@{ kCIInputScaleKey:       @(scale),
-                                                      kCIInputAspectRatioKey: @(aspect) }];
-    [_ci render:scaled
-       toBitmap:_rgba
-       rowBytes:AIImgSize * 4
-         bounds:CGRectMake(0, 0, AIImgSize, AIImgSize)
-         format:kCIFormatRGBA8
-     colorSpace:_rgb];
+    if (CVPixelBufferGetPixelFormatType(pb) == kCVPixelFormatType_32BGRA &&
+        orientation == kCGImagePropertyOrientationUp) {
+        // Already RGB: read it directly.
+        CVPixelBufferLockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+        locked = YES;
+        pixels = CVPixelBufferGetBaseAddress(pb);
+        w = CVPixelBufferGetWidth(pb);
+        h = CVPixelBufferGetHeight(pb);
+        rowBytes = CVPixelBufferGetBytesPerRow(pb);
+        r = 2; g = 1; b = 0;
+    } else {
+        // YUV (ReplayKit's usual 420f) or rotated: CoreImage does the YCbCr->RGB matrix and
+        // the rotation at full resolution, with colour management disabled.
+        CIImage *image = [CIImage imageWithCVPixelBuffer:pb options:@{ kCIImageColorSpace: [NSNull null] }];
+        if (orientation != kCGImagePropertyOrientationUp)
+            image = [image imageByApplyingCGOrientation:orientation];
+        CGRect e = image.extent;
+        if (CGRectIsEmpty(e) || CGRectIsInfinite(e)) return NO;
+        image = [image imageByApplyingTransform:CGAffineTransformMakeTranslation(-e.origin.x, -e.origin.y)];
+        w = (size_t)e.size.width;
+        h = (size_t)e.size.height;
+        rowBytes = w * 4;
+        if (rowBytes * h > _rgbaCapacity) {
+            free(_rgba);
+            _rgba = malloc(rowBytes * h);
+            _rgbaCapacity = _rgba ? rowBytes * h : 0;
+            if (!_rgba) return NO;
+        }
+        [_ci render:image toBitmap:_rgba rowBytes:(ptrdiff_t)rowBytes bounds:CGRectMake(0, 0, w, h)
+             format:kCIFormatRGBA8 colorSpace:nil];
+        pixels = _rgba;
+    }
+
+    BOOL ok = pixels != NULL && w > 0 && h > 0;
+    if (ok && (!_hasResampler || _rsW != (int)w || _rsH != (int)h)) {
+        if (_hasResampler) AIResamplerFree(&_resampler);
+        _hasResampler = AIResamplerInit(&_resampler, (int)w, (int)h, (int)_S, (int)_S) == 0;
+        _rsW = (int)w;
+        _rsH = (int)h;
+        ok = _hasResampler;
+        if (ok) AILog("Capture %zux%zu -> %ldx%ld", w, h, (long)_S, (long)_S);
+    }
+    if (ok) {
+        memcpy(_prevGray, _gray, (size_t)_pixels);
+        AIResizeToGray(&_resampler, pixels, rowBytes, r, g, b, _gray);
+        for (NSInteger i = 0; i < _pixels; i++) _gray[i] = _lut[_gray[i]];
+    }
+    if (locked) CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
+    return ok;
+}
+
+- (BOOL)_readHeads:(id<MLFeatureProvider>)result error:(NSError *)error into:(AIPrediction *)out {
+    float det = 0, dir[4] = { 0, 0, 0, 0 };
+    if (!result ||
+        !AICopyVector([result featureValueForName:@"det_logit"].multiArrayValue, &det, 1) ||
+        !AICopyVector([result featureValueForName:@"dir_logits"].multiArrayValue, dir, 4)) {
+        AILog("Prediction failed: %{public}@", error.localizedDescription ?: @"bad output");
+        return NO;
+    }
+    AIFillPrediction(det, dir, out);
     return YES;
 }
 
-// _rgba -> gray + diff staged in _encBuf; updates _prevGray.
-- (void)_packLocked {
-    float *grayOut = _encBuf;
-    float *diffOut = _encBuf + AIPixels;
-    const uint8_t *px = _rgba;
-    for (NSInteger i = 0; i < AIPixels; i++, px += 4) {
-        float l = 0.2989f * px[0] + 0.5870f * px[1] + 0.1140f * px[2];
-        int g = (int)roundf(l);
-        g = g < 0 ? 0 : (g > 255 ? 255 : g);
-        int prev = _hasPrev ? _prevGray[i] : g;
-        _gray[i] = (uint8_t)g;
-        grayOut[i] = (float)g;
-        diffOut[i] = (float)_diffLUT[g - prev + 255];
-    }
-    memcpy(_prevGray, _gray, sizeof(_gray));
-    _hasPrev = YES;
+- (BOOL)_simplePredict:(AIPrediction *)out {
+    for (NSInteger i = 0; i < _pixels; i++) _stage[i] = (float)_gray[i];
+    AIFillArray(_in, _stage, _pixels);
+    NSError *error = nil;
+    id<MLFeatureProvider> result = [_model predictionFromFeatures:_provider error:&error];
+    return [self _readHeads:result error:error into:out];
 }
 
-// Runs the CNN on _encIn and appends the feature to the ring.
-- (BOOL)_encodeLocked {
-    AIFillArray(_encIn, _encBuf, 2 * AIPixels);
+// Encode this tick into the ring; when warm and `out` is given, run the windowed head.
+- (BOOL)_causalStepHeld:(BOOL)held prediction:(AIPrediction *)out {
+    float *grayOut = _stage, *diffOut = _stage + _pixels;
+    for (NSInteger i = 0; i < _pixels; i++) {
+        grayOut[i] = (float)_gray[i];
+        // First frame and held (repeated) frames have a neutral diff, as in training.
+        diffOut[i] = (held || !_hasPrev) ? 127.0f : (float)AIDiffValue(_gray[i], _prevGray[i]);
+    }
+    if (!held) _hasPrev = YES;
+
+    AIFillArray(_in, _stage, 2 * _pixels);
     NSError *error = nil;
-    id<MLFeatureProvider> result = [_encoder predictionFromFeatures:_encProvider error:&error];
-    MLMultiArray *feat = [result featureValueForName:@"feat"].multiArrayValue;
-    if (!AICopyVector(feat, _ring[_tick % AIHistory], AIFeatDim)) {
+    id<MLFeatureProvider> enc = [_model predictionFromFeatures:_provider error:&error];
+    const NSInteger D = _cfg.featDim;
+    if (!AICopyVector([enc featureValueForName:@"feat"].multiArrayValue, _ring + (_tick % _history) * D, D)) {
         AILog("Encoder failed: %{public}@", error.localizedDescription ?: @"bad output");
         return NO;
     }
     _tick++;
-    return YES;
-}
+    if (!out || _tick < _history) return NO;
 
-// Windowed head over cached features; identical to training's forward().
-- (BOOL)_predictLocked:(AIPrediction *)out {
-    if (_tick < AIHistory) return NO;                      // still warming up
-
-    float *fast = _fastBuf;
-    float *slow = _slowBuf;
-    for (NSInteger k = 0; k < AIFastLen; k++) {
-        NSInteger age = AIFastLen - 1 - k;                 // oldest first
-        memcpy(fast + k * AIFeatDim, _ring[(_tick - 1 - age) % AIHistory], sizeof(float) * AIFeatDim);
+    const NSInteger F = _cfg.fastLen;
+    for (NSInteger k = 0; k < F; k++) {                         // [t-F+1 .. t], oldest first
+        NSInteger age = F - 1 - k;
+        memcpy(_fastBuf + k * D, _ring + ((_tick - 1 - age) % _history) * D, sizeof(float) * (size_t)D);
     }
-    for (NSInteger j = 0; j < AISlowLen; j++) {
-        memcpy(slow + j * AIFeatDim, _ring[(_tick - 1 - kSlowOffsets[j]) % AIHistory],
-               sizeof(float) * AIFeatDim);
+    NSInteger j = 0;
+    for (NSNumber *offset in _cfg.slowOffsets) {                // e.g. [t-19, t-13]
+        memcpy(_slowBuf + j * D, _ring + ((_tick - 1 - offset.integerValue) % _history) * D,
+               sizeof(float) * (size_t)D);
+        j++;
     }
-
-    AIFillArray(_headFast, _fastBuf, AIFastLen * AIFeatDim);
-    AIFillArray(_headSlow, _slowBuf, AISlowLen * AIFeatDim);
-    NSError *error = nil;
+    AIFillArray(_headFast, _fastBuf, F * D);
+    AIFillArray(_headSlow, _slowBuf, j * D);
     id<MLFeatureProvider> result = [_head predictionFromFeatures:_headProvider error:&error];
-    float detLogit = 0, dirLogits[4] = { 0, 0, 0, 0 };
-    if (!result ||
-        !AICopyVector([result featureValueForName:@"det_logit"].multiArrayValue, &detLogit, 1) ||
-        !AICopyVector([result featureValueForName:@"dir_logits"].multiArrayValue, dirLogits, 4)) {
-        AILog("Head failed: %{public}@", error.localizedDescription ?: @"bad output");
-        return NO;
-    }
-
-    float maxLogit = fmaxf(fmaxf(dirLogits[0], dirLogits[1]), fmaxf(dirLogits[2], dirLogits[3]));
-    float e[4], sum = 0;
-    for (int i = 0; i < 4; i++) { e[i] = expf(dirLogits[i] - maxLogit); sum += e[i]; }
-    int best = 0;
-    for (int i = 1; i < 4; i++) if (e[i] > e[best]) best = i;
-
-    out->detProbability = 1.0f / (1.0f + expf(-detLogit));
-    out->direction      = (AISwipeDirection)best;
-    out->dirConfidence  = e[best] / sum;
-    return YES;
+    return [self _readHeads:result error:error into:out];
 }
 
 @end
 
 // =============================================================================
-// MARK: - Touch synthesis
+// MARK: - Debug dump
 //
-// Builds a UITouch + UITouchesEvent by hand (private API, validated on-device)
-// and delivers it through the window and, because sendEvent: alone was
-// swallowed on the target build, directly to the hit-tested view.
+// With "debug_dump_frames": N in the config, the first N ticks after AI ON are
+// written to Documents/AIPlayerDump/<time>/:
+//   frames.u8   N x img x img uint8, exactly what the model saw
+//   ticks.csv   tick,held,has_pred,det_prob,p_up,p_down,p_left,p_right,fired
+//   config.json the config in use
+// tools/diagnose.py compares these against PyTorch and the training frames.
+// =============================================================================
+
+@interface AIDumpWriter : NSObject
+- (nullable instancetype)initWithConfig:(AIConfig *)config;
+- (BOOL)wantsMore;
+- (void)appendGray:(const uint8_t *)gray held:(BOOL)held prediction:(const AIPrediction *)p fired:(BOOL)fired;
+@end
+
+@implementation AIDumpWriter {
+    dispatch_queue_t _queue;
+    NSFileHandle *_frames, *_csv;
+    NSInteger _limit, _count, _pixels;
+    NSString *_dir;
+}
+
+- (instancetype)initWithConfig:(AIConfig *)config {
+    if (!(self = [super init])) return nil;
+    NSString *docs = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSDateFormatter *fmt = [NSDateFormatter new];
+    fmt.dateFormat = @"yyyyMMdd-HHmmss";
+    _dir = [[docs stringByAppendingPathComponent:@"AIPlayerDump"]
+            stringByAppendingPathComponent:[fmt stringFromDate:[NSDate date]]];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm createDirectoryAtPath:_dir withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
+
+    NSString *framesPath = [_dir stringByAppendingPathComponent:@"frames.u8"];
+    NSString *csvPath = [_dir stringByAppendingPathComponent:@"ticks.csv"];
+    [fm createFileAtPath:framesPath contents:nil attributes:nil];
+    [fm createFileAtPath:csvPath
+                contents:[@"tick,held,has_pred,det_prob,p_up,p_down,p_left,p_right,fired\n"
+                          dataUsingEncoding:NSUTF8StringEncoding]
+              attributes:nil];
+    NSData *cfg = [NSJSONSerialization dataWithJSONObject:config.raw options:NSJSONWritingPrettyPrinted error:nil];
+    [cfg writeToFile:[_dir stringByAppendingPathComponent:@"config.json"] atomically:YES];
+
+    _frames = [NSFileHandle fileHandleForWritingAtPath:framesPath];
+    _csv = [NSFileHandle fileHandleForWritingAtPath:csvPath];
+    [_csv seekToEndOfFile];
+    if (!_frames || !_csv) return nil;
+    _queue = dispatch_queue_create("com.aiplayer.dump", DISPATCH_QUEUE_SERIAL);
+    _limit = config.debugDumpFrames;
+    _pixels = config.imgSize * config.imgSize;
+    AILog("Dumping %ld ticks to %{public}@", (long)_limit, _dir);
+    return self;
+}
+
+- (BOOL)wantsMore { return _count < _limit; }
+
+- (void)appendGray:(const uint8_t *)gray held:(BOOL)held prediction:(const AIPrediction *)p fired:(BOOL)fired {
+    if (_count >= _limit) return;
+    NSInteger tick = _count++;
+    BOOL last = _count == _limit;
+    NSData *frame = [NSData dataWithBytes:gray length:(NSUInteger)_pixels];
+    NSString *line = p
+        ? [NSString stringWithFormat:@"%ld,%d,1,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n", (long)tick, held,
+           p->detProbability, p->dirProbs[0], p->dirProbs[1], p->dirProbs[2], p->dirProbs[3], fired]
+        : [NSString stringWithFormat:@"%ld,%d,0,,,,,,0\n", (long)tick, held];
+    dispatch_async(_queue, ^{
+        [self->_frames writeData:frame];
+        [self->_csv writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+        if (last) {
+            [self->_frames closeFile];
+            [self->_csv closeFile];
+            AILog("Dump complete: %{public}@", self->_dir);
+        }
+    });
+}
+
+@end
+
+// =============================================================================
+// MARK: - Touch synthesis (unchanged, validated on-device)
+//
+// Builds a UITouch + UITouchesEvent by hand (private API) and delivers it through
+// the window and, because sendEvent: alone was swallowed on the target build,
+// directly to the hit-tested view.
 // =============================================================================
 
 // UIKit's private -_initWithEvent:touches: reads a GSEvent-shaped struct.
@@ -617,7 +788,6 @@ static void AIInstallTouchFallbackSwizzle(void) {
     });
 }
 
-// Raw ivar access for scalar fields (UITouch exposes no setters for these).
 static void *AIIvarPointer(id object, const char *name) {
     Ivar ivar = class_getInstanceVariable(object_getClass(object), name);
     return ivar ? (uint8_t *)(__bridge void *)object + ivar_getOffset(ivar) : NULL;
@@ -654,8 +824,6 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 }
 
 @interface AITouchSynthesizer : NSObject
-// Starts (Began), advances (Moved) or finishes (Ended/Cancelled) a single-finger
-// touch. Returns the live touch, or nil once it has ended.
 - (nullable UITouch *)dispatchPhase:(UITouchPhase)phase atPoint:(CGPoint)point
                               touch:(nullable UITouch *)touch;
 @end
@@ -747,7 +915,7 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
         case UITouchPhaseMoved:     [view touchesMoved:touches withEvent:event]; break;
         case UITouchPhaseEnded:     [view touchesEnded:touches withEvent:event]; break;
         case UITouchPhaseCancelled: [view touchesCancelled:touches withEvent:event]; break;
-        default: break;                                    // Stationary: nothing to deliver
+        default: break;
     }
 }
 
@@ -834,7 +1002,7 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 }
 
 - (void)_dispatchPhase:(UITouchPhase)phase at:(CGPoint)point {
-    if (!_touch && phase != UITouchPhaseBegan) return;      // swipe never started (no window)
+    if (!_touch && phase != UITouchPhaseBegan) return;
     _lastPoint = point;
     _touch = [_synth dispatchPhase:phase atPoint:point touch:_touch];
 }
@@ -846,19 +1014,25 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 // =============================================================================
 
 @interface AIPlayerController : NSObject
-@property (nonatomic, readonly) AIPlayerState state;                       // main thread
-@property (nonatomic, copy, nullable) void (^onStateChange)(AIPlayerState state);   // main thread
+@property (nonatomic, readonly) AIPlayerState state;                               // main thread
+@property (nonatomic, copy, nullable) void (^onStateChange)(AIPlayerState state);  // main thread
 + (instancetype)shared;
-- (void)toggle;                                                            // main thread
+- (void)toggle;                                                                    // main thread
 @end
 
 @implementation AIPlayerController {
-    AIInferenceEngine *_engine;
     dispatch_queue_t _setupQueue;
     AIPlayerState _state;
     atomic_bool _active;                 // read by the capture queue
 
-    // Touched only by the capture queue (reset before capture starts).
+    // Set on the setup queue before capture starts; read by the capture queue.
+    AIConfig *_config;
+    AIInferenceEngine *_engine;
+    AIDumpWriter *_dump;
+    uint8_t *_dumpGray;
+
+    // Capture queue only (reset before capture starts).
+    CFTimeInterval _tickInterval;
     BOOL _hasClock;
     CFTimeInterval _nextTick;
     BOOL _armed;
@@ -878,12 +1052,9 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 
 - (instancetype)init {
     if ((self = [super init])) {
-        _engine = [AIInferenceEngine new];
         _setupQueue = dispatch_queue_create("com.aiplayer.setup", DISPATCH_QUEUE_SERIAL);
         atomic_init(&_active, false);
-
-        // Load models in the background so the first tap is instant.
-        dispatch_async(_setupQueue, ^{ [self _ensureModelsLoaded:NULL]; });
+        dispatch_async(_setupQueue, ^{ [self _ensureLoaded:NULL]; });   // first tap is instant
 
         [[NSNotificationCenter defaultCenter]
             addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil
@@ -894,6 +1065,8 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     }
     return self;
 }
+
+- (void)dealloc { free(_dumpGray); }
 
 - (AIPlayerState)state { return _state; }
 
@@ -909,19 +1082,20 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
 
-- (BOOL)_ensureModelsLoaded:(NSError **)error {          // setup queue only
-    if (_engine.isLoaded) return YES;
-    NSURL *directory = AIFindModelDirectory();
-    if (!directory) {
-        if (error) *error = AIError(1, @"SwipeEncoder/SwipeHead .mlmodelc not found");
-        return NO;
-    }
+- (BOOL)_ensureLoaded:(NSError **)error {          // setup queue only
+    if (_engine) return YES;
+    AIConfig *config = [AIConfig locateAndLoad:error];
+    if (!config) return NO;
     NSError *loadError = nil;
-    if (![_engine loadModelsFromDirectory:directory error:&loadError]) {
+    AIInferenceEngine *engine = [[AIInferenceEngine alloc] initWithConfig:config error:&loadError];
+    if (!engine) {
         AILog("Model load failed: %{public}@", loadError.localizedDescription);
         if (error) *error = loadError;
         return NO;
     }
+    _config = config;
+    _engine = engine;
+    _tickInterval = 1.0 / config.tickHz;
     return YES;
 }
 
@@ -929,7 +1103,7 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     [self _setState:AIPlayerStateStarting];
     dispatch_async(_setupQueue, ^{
         NSError *error = nil;
-        if (![self _ensureModelsLoaded:&error]) {
+        if (![self _ensureLoaded:&error]) {
             AILog("Cannot start: %{public}@", error.localizedDescription);
             dispatch_async(dispatch_get_main_queue(), ^{ [self _setState:AIPlayerStateOff]; });
             return;
@@ -977,35 +1151,51 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     }];
 }
 
-- (void)_resetRuntimeState {
+- (void)_resetRuntimeState {                       // setup queue, before capture starts
     _hasClock = NO;
     _nextTick = 0;
-    _armed = NO;          // must observe a low probability before the first fire
+    _armed = NO;                                   // must see a low probability before the first fire
     _lastFire = 0;
     _statsStart = 0;
     _statFrames = _statTicks = _statPreds = _statFires = 0;
     _statDetSum = 0;
     _statDetMax = 0;
+
+    _dump = nil;
+    if (_config.debugDumpFrames > 0) {
+        if (!_dumpGray) _dumpGray = malloc((size_t)(_config.imgSize * _config.imgSize));
+        if (_dumpGray) _dump = [[AIDumpWriter alloc] initWithConfig:_config];
+    }
 }
 
 // ── capture queue ───────────────────────────────────────────────────────────
 
-// Number of 24 Hz ticks the frame stamped `time` accounts for (0 = drop it).
+// Number of ticks the frame stamped `time` accounts for (0 = drop it).
 - (NSInteger)_ticksDueAt:(CFTimeInterval)time {
     if (!_hasClock) {
         _hasClock = YES;
-        _nextTick = time + kTickInterval;
+        _nextTick = time + _tickInterval;
         return 1;
     }
     CFTimeInterval ahead = time + kTickTolerance - _nextTick;
     if (ahead < 0) return 0;
-    NSInteger due = 1 + (NSInteger)floor(ahead / kTickInterval);
-    if (due > kMaxCatchUpTicks) {                          // stall or discontinuity: resync
-        _nextTick = time + kTickInterval;
+    NSInteger due = 1 + (NSInteger)floor(ahead / _tickInterval);
+    if (due > kMaxCatchUpTicks) {                  // stall or discontinuity: resync
+        _nextTick = time + _tickInterval;
         return 1;
     }
-    _nextTick += due * kTickInterval;
+    _nextTick += due * _tickInterval;
     return due;
+}
+
+static CGImagePropertyOrientation AIBufferOrientation(CMSampleBufferRef buffer) {
+    CFTypeRef value = CMGetAttachment(buffer, (__bridge CFStringRef)RPVideoSampleOrientationKey, NULL);
+    if (value && CFGetTypeID(value) == CFNumberGetTypeID()) {
+        uint32_t o = 0;
+        CFNumberGetValue((CFNumberRef)value, kCFNumberSInt32Type, &o);
+        if (o >= 1 && o <= 8) return (CGImagePropertyOrientation)o;
+    }
+    return kCGImagePropertyOrientationUp;
 }
 
 - (void)_handleSampleBuffer:(CMSampleBufferRef)buffer {
@@ -1018,29 +1208,44 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 
     NSInteger due = [self _ticksDueAt:time];
     if (due == 0) return;
-
-    for (NSInteger i = 0; i < due - 1; i++) [_engine ingestHeldFrame];   // source skipped ticks
     _statTicks += due;
 
+    for (NSInteger i = 0; i < due - 1; i++) {      // source skipped ticks: hold the last frame
+        [_engine ingestHeldFrame];
+        [self _dumpHeld:YES prediction:NULL fired:NO];
+    }
+
     AIPrediction prediction;
-    if ([_engine ingestFrame:pixels prediction:&prediction]) [self _handlePrediction:prediction];
+    BOOL has = [_engine ingestFrame:pixels orientation:AIBufferOrientation(buffer) prediction:&prediction];
+    BOOL fired = has && [self _handlePrediction:prediction];
+    [self _dumpHeld:NO prediction:has ? &prediction : NULL fired:fired];
     [self _logStatsIfDue];
 }
 
-- (void)_handlePrediction:(AIPrediction)p {
+- (void)_dumpHeld:(BOOL)held prediction:(const AIPrediction *)p fired:(BOOL)fired {
+    if (!_dump || ![_dump wantsMore]) return;
+    [_engine copyLastGray:_dumpGray];
+    [_dump appendGray:_dumpGray held:held prediction:p fired:fired];
+}
+
+// Fires at most once per detection burst: prob must drop below release_threshold
+// before the next prob >= fire_threshold can fire again.
+- (BOOL)_handlePrediction:(AIPrediction)p {
     _statPreds++;
     _statDetSum += p.detProbability;
     if (p.detProbability > _statDetMax) _statDetMax = p.detProbability;
 
-    if (p.detProbability < kReleaseThreshold) _armed = YES;
-    if (!_armed || p.detProbability < kFireThreshold || p.dirConfidence < kMinDirConfidence) return;
+    if (p.detProbability < _config.releaseThreshold) _armed = YES;
+    if (!_armed || p.detProbability < _config.fireThreshold) return NO;
+    if (p.dirConfidence < _config.minDirConfidence) return NO;
 
     CFTimeInterval now = CACurrentMediaTime();
-    if (now - _lastFire < kInjectCooldown) return;
+    if (now - _lastFire < _config.cooldown) return NO;
     _lastFire = now;
-    _armed = NO;                                           // one fire per detection burst
+    _armed = NO;
     _statFires++;
     [[AISwipeInjector shared] swipeInDirection:p.direction];
+    return YES;
 }
 
 - (void)_logStatsIfDue {
@@ -1061,10 +1266,12 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
 
 // =============================================================================
 // MARK: - Overlay UI: one draggable AI ON/OFF button
+//
+// ReplayKit's in-app capture records every window of the app, including this
+// one, and the model never saw a button in training. While the AI is ON the
+// button therefore collapses to a small, faint dot (still tappable to stop).
 // =============================================================================
 
-// Both overrides return nil for "hit nothing" so every touch outside the button
-// falls through to the game, and the window never takes key status.
 @interface AIPassthroughView : UIView @end
 @implementation AIPassthroughView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
@@ -1099,8 +1306,6 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     [super viewDidLoad];
 
     _button = [UIButton buttonWithType:UIButtonTypeCustom];
-    _button.bounds = CGRectMake(0, 0, 130, 44);
-    _button.layer.cornerRadius = 12;
     _button.clipsToBounds = YES;
     _button.titleLabel.font = [UIFont monospacedSystemFontOfSize:12 weight:UIFontWeightBold];
     [_button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
@@ -1120,25 +1325,35 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     CGRect bounds = self.view.bounds;
     if (_placed || CGRectGetWidth(bounds) <= 0) return;
     _placed = YES;
-    _button.center = CGPointMake(CGRectGetWidth(bounds) - 80,
-                                 MAX(self.view.safeAreaInsets.top, 20) + 60);
+    _button.center = CGPointMake(CGRectGetWidth(bounds) - 80, MAX(self.view.safeAreaInsets.top, 20) + 60);
 }
 
 - (void)_render:(AIPlayerState)state {
-    NSString *title;
-    UIColor *color;
-    switch (state) {
-        case AIPlayerStateOn:
-            title = @"■ AI: ON";   color = [UIColor colorWithRed:0.20 green:0.70 blue:0.35 alpha:0.95]; break;
-        case AIPlayerStateStarting:
-            title = @"… STARTING"; color = [UIColor colorWithRed:0.85 green:0.65 blue:0.15 alpha:0.95]; break;
-        case AIPlayerStateStopping:
-            title = @"… STOPPING"; color = [UIColor colorWithRed:0.85 green:0.65 blue:0.15 alpha:0.95]; break;
-        default:
-            title = @"▶ AI: OFF";  color = [UIColor colorWithWhite:0.15 alpha:0.92]; break;
+    CGPoint center = _button.center;
+    if (state == AIPlayerStateOn) {
+        _button.bounds = CGRectMake(0, 0, 22, 22);
+        _button.layer.cornerRadius = 11;
+        _button.alpha = 0.35;
+        [_button setTitle:nil forState:UIControlStateNormal];
+        _button.backgroundColor = [UIColor colorWithRed:0.20 green:0.70 blue:0.35 alpha:1.0];
+    } else {
+        NSString *title;
+        UIColor *color;
+        switch (state) {
+            case AIPlayerStateStarting:
+                title = @"… STARTING"; color = [UIColor colorWithRed:0.85 green:0.65 blue:0.15 alpha:0.95]; break;
+            case AIPlayerStateStopping:
+                title = @"… STOPPING"; color = [UIColor colorWithRed:0.85 green:0.65 blue:0.15 alpha:0.95]; break;
+            default:
+                title = @"▶ AI: OFF";  color = [UIColor colorWithWhite:0.15 alpha:0.92]; break;
+        }
+        _button.bounds = CGRectMake(0, 0, 130, 44);
+        _button.layer.cornerRadius = 12;
+        _button.alpha = 1.0;
+        [_button setTitle:title forState:UIControlStateNormal];
+        _button.backgroundColor = color;
     }
-    [_button setTitle:title forState:UIControlStateNormal];
-    _button.backgroundColor = color;
+    _button.center = center;
 }
 
 - (void)_tapped { [[AIPlayerController shared] toggle]; }

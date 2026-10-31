@@ -47,41 +47,42 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install Core ML conversion dependencies
+      - name: Install Python dependencies
         run: |
           set -euo pipefail
-          # torch pinned per coremltools' own compatibility notes.
-          pip install torch==2.7.0 coremltools
+          pip install torch==2.7.0 torchvision==0.22.0 "coremltools>=8,<10"
 
-      # ── Checkpoint -> two Core ML models ─────────────────────────────────
-      # convert_to_coreml.py exports SwipeEncoder.mlmodel (per-frame CNN) and
-      # SwipeHead.mlmodel (windowed GRU head, zero initial state), then
-      # verifies on this macOS runner that
-      #   (1) the unrolled torch pipeline equals model.forward(), and
-      #   (2) the saved Core ML models, run on CPU, equal model.forward().
-      # Any mismatch fails the build, so a model that does not match what
-      # training validated can never be packaged.
+      # The on-device preprocessing (AIPreprocess.c) must stay bit-exact with the
+      # dataset builder's torchvision resize + grayscale. Fails the build otherwise.
+      - name: Test preprocessing parity
+        run: python tools/test_preprocess.py
+
+      # Detects simple vs causal from the checkpoint, checks the exported graph
+      # against model.forward() in torch AND (on this macOS runner) in Core ML,
+      # and writes AIPlayerConfig.json. Any mismatch fails the build.
       - name: Convert checkpoint to Core ML
         run: |
           set -euo pipefail
-          python convert_to_coreml.py \
-            --checkpoint checkpoints/best.pt \
-            --out_dir . \
-            --img_size 128
+          python convert_to_coreml.py --checkpoint checkpoints/best.pt --out_dir build
+          cat build/AIPlayerConfig.json
 
-      # `coremlcompiler` can print errors and still exit 0, so any "error"
-      # text in its output is treated as fatal regardless of exit code.
+      # `coremlcompiler` can print errors and still exit 0, so any "error" text in
+      # its output is treated as fatal regardless of exit code.
       - name: Compile Core ML models
         run: |
           set -euo pipefail
-          for name in SwipeEncoder SwipeHead; do
-            xcrun coremlcompiler compile "$name.mlmodel" . 2>&1 | tee "/tmp/$name.log"
+          cd build
+          for model in *.mlmodel; do
+            name="${model%.mlmodel}"
+            xcrun coremlcompiler compile "$model" . 2>&1 | tee "/tmp/$name.log"
             if [ "${PIPESTATUS[0]}" -ne 0 ] || grep -qi "error" "/tmp/$name.log"; then
               echo "ERROR: coremlcompiler failed for $name"; exit 1
             fi
             test -d "$name.mlmodelc" || { echo "ERROR: $name.mlmodelc was not produced"; exit 1; }
             du -sh "$name.mlmodelc"
           done
+          # Every model the config lists must exist.
+          python -c "import json,os,sys; c=json.load(open('AIPlayerConfig.json')); m=[x for x in c['models'] if not os.path.isdir(x)]; sys.exit('missing: %s' % m if m else 0)"
 
       - name: Build dylib
         run: |
@@ -107,15 +108,16 @@ jobs:
           path: ${{ steps.find_dylib.outputs.dylib_path }}
           if-no-files-found: error
 
-      # Both compiled models in one zip. Unzip, then drag BOTH .mlmodelc
-      # folders into Sideloadly next to AIPlayer.dylib.
-      - name: Package Core ML models for Sideloadly
+      # AIPlayerConfig.json + every .mlmodelc it lists. Unzip, then add ALL of it
+      # in Sideloadly next to AIPlayer.dylib.
+      - name: Package models for Sideloadly
         run: |
           set -euo pipefail
-          zip -r AIPlayerModels.zip SwipeEncoder.mlmodelc SwipeHead.mlmodelc
-          unzip -l AIPlayerModels.zip | head -30
+          cd build
+          zip -r ../AIPlayerModels.zip AIPlayerConfig.json *.mlmodelc
+          unzip -l ../AIPlayerModels.zip | head -40
 
-      - name: Upload Core ML models (for Sideloadly injection)
+      - name: Upload models (for Sideloadly injection)
         uses: actions/upload-artifact@v4
         with:
           name: AIPlayer-models

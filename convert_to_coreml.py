@@ -1,51 +1,38 @@
 #!/usr/bin/env python3
 """
-convert_to_coreml.py — export a CausalSwipeAnnotator checkpoint as two Core ML
-models that reproduce the windowed `forward()` used in training exactly.
+convert_to_coreml.py — turn a training checkpoint into what AIPlayer.dylib loads.
 
     pip install torch==2.7.0 coremltools
-    python convert_to_coreml.py --checkpoint checkpoints/best.pt --out_dir . --img_size 128
+    python convert_to_coreml.py --checkpoint checkpoints/best.pt --out_dir build
 
-Outputs (classic "neuralnetwork" spec, single .mlmodel files):
+The checkpoint kind is detected from its weights:
 
-    SwipeEncoder.mlmodel
-        in : frame      (1, 2, H, W) float32   (gray, diff) pair, RAW 0..255 values
-        out: feat       (1, 128)     float32
-      Run once per new frame; the host keeps the last 20 features.
+  simple  (train_simple.py / SimpleSwipeAnnotator) -> one model
+      SwipeSimple.mlmodel   frame (1,1,H,W) gray, raw 0..255 -> det_logit (1,), dir_logits (1,4)
 
-    SwipeHead.mlmodel
-        in : fast_feats (1, 8, 128)  float32   features of frames [t-7 ... t], oldest first
-             slow_feats (1, 2, 128)  float32   features of frames [t-19, t-13], oldest first
-        out: det_logit  (1,)         sigmoid() -> detection probability
-             dir_logits (1, 4)       softmax() -> [UP, DOWN, LEFT, RIGHT]
-      Both GRUs are unrolled from a zero hidden state, exactly like training.
+  causal  (train_causal.py / CausalSwipeAnnotator) -> two models
+      SwipeEncoder.mlmodel  frame (1,2,H,W) (gray, diff), raw 0..255 -> feat (1,128)
+      SwipeHead.mlmodel     fast_feats (1,8,128) [t-7..t], slow_feats (1,2,128) [t-19,t-13]
+                            -> det_logit (1,), dir_logits (1,4)
+      The device caches one encoder feature per tick and re-runs the head from a
+      zero GRU state each tick, which is exactly what training evaluated.
 
-Why two models and no carried hidden state
-------------------------------------------
-Training evaluates every sample from a zero hidden state over exactly 8 fast
-and 2 slow frames. A streaming export that carries GRU state across the whole
-session computes a different function that the checkpoint was never validated
-on. Caching per-frame features on the host and re-running the (cheap) temporal
-head per tick reproduces training exactly while still running the CNN once per
-frame.
+It always writes AIPlayerConfig.json next to the models. AIPlayer reads the model
+kind, input size, tick rate and gate thresholds from that file, so the dylib never
+has to be rebuilt to change them, and a model can't be paired with the wrong
+pipeline.
 
-Why GRUs are unrolled by hand
------------------------------
-coremltools lowers nn.GRU to a while_loop with gather/scatter, which Core ML's
-compiler rejects ("Unsupported opset for gather op") while still exiting 0.
-`manual_gru_step` implements PyTorch's documented GRU equations with the
-trained weights; tracing fully unrolls the fixed-length Python loops into
-straight-line ops. Equivalence is asserted on every run.
+Every run checks that the exported computation equals model.forward() in PyTorch,
+and on macOS that the saved Core ML models agree too; any mismatch aborts.
 
-Why "neuralnetwork" instead of "mlprogram"
-------------------------------------------
-mlprogram's AOT compilation was observed to emit an empty .mlmodelc silently.
-Every op used here (conv, batchnorm, relu, pool, linear, elementwise, concat,
-sigmoid, tanh) has been supported since Core ML 1.0. The format caps the
-deployment target at iOS 14, which is a floor, not a ceiling.
+Why "neuralnetwork" and hand-unrolled GRUs: Core ML's compiler rejects the
+while_loop/gather ops coremltools emits for nn.GRU (while still exiting 0), and
+mlprogram AOT compilation was seen emitting an empty .mlmodelc. Every op used here
+has been supported since Core ML 1.0.
 """
 
 import argparse
+import json
 import os
 import sys
 
@@ -53,233 +40,302 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from model_causal import (CausalSwipeAnnotator, FAST_LEN, FEAT_DIM, SLOW_OFFSETS,
-                          build_causal_model)
-
-SLOW_LEN = len(SLOW_OFFSETS)
-TORCH_ATOL = 1e-4          # unrolled torch pipeline vs. model.forward()
-COREML_ATOL = 2e-2         # Core ML (CPU) vs. model.forward()
+TORCH_ATOL = 1e-4       # exported torch graph vs. model.forward()
+COREML_ATOL = 2e-2      # Core ML (CPU) vs. model.forward()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Hand-unrolled GRU
+# Checkpoint loading
 # ─────────────────────────────────────────────────────────────────────────────
 
-def manual_gru_step(x: torch.Tensor, h: torch.Tensor, gru: nn.GRU) -> torch.Tensor:
-    """
-    One timestep through every layer of `gru`, using its trained weights.
-
-        r  = sigmoid(W_ir x + b_ir + W_hr h + b_hr)
-        z  = sigmoid(W_iz x + b_iz + W_hz h + b_hz)
-        n  = tanh   (W_in x + b_in + r * (W_hn h + b_hn))
-        h' = (1 - z) * n + z * h
-
-    x: (B, input)   h: (layers, B, hidden)   returns h': (layers, B, hidden)
-    """
-    layer_input = x
-    new_states = []
-    for layer in range(h.shape[0]):
-        w_ih = getattr(gru, f"weight_ih_l{layer}")
-        w_hh = getattr(gru, f"weight_hh_l{layer}")
-        b_ih = getattr(gru, f"bias_ih_l{layer}")
-        b_hh = getattr(gru, f"bias_hh_l{layer}")
-        h_prev = h[layer]
-        hidden = h_prev.shape[-1]
-
-        i_r, i_z, i_n = (layer_input @ w_ih.t() + b_ih).split(hidden, dim=-1)
-        h_r, h_z, h_n = (h_prev @ w_hh.t() + b_hh).split(hidden, dim=-1)
-        r = torch.sigmoid(i_r + h_r)
-        z = torch.sigmoid(i_z + h_z)
-        n = torch.tanh(i_n + r * h_n)
-        h_new = (1 - z) * n + z * h_prev
-
-        new_states.append(h_new)
-        layer_input = h_new
-    return torch.stack(new_states, dim=0)
+def detect_kind(state: dict) -> str:
+    if any(k.startswith("fast_gru.") for k in state):
+        return "causal"
+    if "trunk.0.weight" in state:
+        return "simple"
+    sys.exit("[error] unrecognised checkpoint: expected SimpleSwipeAnnotator or CausalSwipeAnnotator weights")
 
 
-def unrolled_gru(feats: torch.Tensor, h0: torch.Tensor, gru: nn.GRU, steps: int) -> torch.Tensor:
-    """feats (B, steps, in), zero h0 (layers, B, hidden) -> last-step top-layer output (B, hidden)."""
-    h = h0
-    for t in range(steps):
-        h = manual_gru_step(feats[:, t], h, gru)
-    return h[-1]
+def load_checkpoint(path: str):
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if "model_state" not in ckpt:
+        sys.exit(f"[error] {path} has no 'model_state'; keys: {list(ckpt.keys())}")
+    state = ckpt["model_state"]
+    kind = detect_kind(state)
+    arch = ckpt.get("arch") or {}
+    args = ckpt.get("args") or {}
+    if not isinstance(args, dict):
+        args = vars(args)
+
+    if kind == "simple":
+        from model_simple import build_simple_model
+        model = build_simple_model(arch)
+    else:
+        from model_causal import build_causal_model
+        model = build_causal_model(arch)
+    model.load_state_dict(state)            # strict: any shape/key mismatch is fatal
+    model.eval()
+    return ckpt, kind, model, args
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Traceable wrappers
 # ─────────────────────────────────────────────────────────────────────────────
+# Same maths as each model's forward() minus the channels_last hint, which is a
+# memory-layout detail with no numeric effect that can trip tracing. Dropout is a
+# no-op in eval() and is left out.
 
-class EncoderWrapper(nn.Module):
-    def __init__(self, model: CausalSwipeAnnotator):
+class SimpleWrapper(nn.Module):
+    def __init__(self, model):
         super().__init__()
         self.model = model
 
     def forward(self, frame):
-        # Same maths as model._cnn_features minus the channels_last hint, which is a
-        # memory-layout detail with no numeric effect and can trip tracing/conversion.
-        return self.model.cnn(frame * (1.0 / 255.0))     # (1, 128)
+        feat = self.model.trunk(self.model.cnn(frame * (1.0 / 255.0)))
+        return self.model.det_head(feat).squeeze(-1), self.model.dir_head(feat)
+
+
+class EncoderWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, frame):
+        return self.model.cnn(frame * (1.0 / 255.0))
+
+
+def gru_step(x, h, gru: nn.GRU):
+    """One timestep through every layer of `gru` (PyTorch's documented GRU equations)."""
+    layer_in, states = x, []
+    for layer in range(h.shape[0]):
+        w_ih, w_hh = getattr(gru, f"weight_ih_l{layer}"), getattr(gru, f"weight_hh_l{layer}")
+        b_ih, b_hh = getattr(gru, f"bias_ih_l{layer}"), getattr(gru, f"bias_hh_l{layer}")
+        h_prev = h[layer]
+        i_r, i_z, i_n = (layer_in @ w_ih.t() + b_ih).split(h_prev.shape[-1], dim=-1)
+        h_r, h_z, h_n = (h_prev @ w_hh.t() + b_hh).split(h_prev.shape[-1], dim=-1)
+        r, z = torch.sigmoid(i_r + h_r), torch.sigmoid(i_z + h_z)
+        n = torch.tanh(i_n + r * h_n)
+        h_new = (1 - z) * n + z * h_prev
+        states.append(h_new)
+        layer_in = h_new
+    return torch.stack(states, dim=0)
 
 
 class HeadWrapper(nn.Module):
-    def __init__(self, model: CausalSwipeAnnotator):
+    def __init__(self, model, fast_len: int, slow_len: int):
         super().__init__()
-        self.model = model
-        self.register_buffer("h0_fast", torch.zeros(model.fast_layers, 1, model.hidden),
-                             persistent=False)
-        self.register_buffer("h0_slow", torch.zeros(model.slow_layers, 1, model.slow_hidden),
-                             persistent=False)
+        self.model, self.fast_len, self.slow_len = model, fast_len, slow_len
+        self.register_buffer("h0_fast", torch.zeros(model.fast_layers, 1, model.hidden), persistent=False)
+        self.register_buffer("h0_slow", torch.zeros(model.slow_layers, 1, model.slow_hidden), persistent=False)
 
     def forward(self, fast_feats, slow_feats):
-        h_fast = unrolled_gru(fast_feats, self.h0_fast, self.model.fast_gru, FAST_LEN)
-        h_slow = unrolled_gru(slow_feats, self.h0_slow, self.model.slow_gru, SLOW_LEN)
-        fused = torch.cat([h_fast, h_slow], dim=-1)      # dropout is a no-op in eval()
+        h_fast, h_slow = self.h0_fast, self.h0_slow
+        for t in range(self.fast_len):
+            h_fast = gru_step(fast_feats[:, t], h_fast, self.model.fast_gru)
+        for t in range(self.slow_len):
+            h_slow = gru_step(slow_feats[:, t], h_slow, self.model.slow_gru)
+        fused = torch.cat([h_fast[-1], h_slow[-1]], dim=-1)
         return self.model.det_head(fused).squeeze(-1), self.model.dir_head(fused)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Verification
+# Export plans: what each kind produces and how to check it
 # ─────────────────────────────────────────────────────────────────────────────
 
-def random_window(img: int, seed: int):
-    g = torch.Generator().manual_seed(seed)
-    fast = torch.randint(0, 256, (1, FAST_LEN, 2, img, img), generator=g).float()
-    slow = torch.randint(0, 256, (1, SLOW_LEN, 2, img, img), generator=g).float()
-    return fast, slow
+def _max_diff(a, b) -> float:
+    return float(np.abs(np.asarray(a, np.float32).reshape(-1) - np.asarray(b, np.float32).reshape(-1)).max())
 
 
-def verify_torch_parity(model, enc: EncoderWrapper, head: HeadWrapper, img: int):
-    """Encoder -> cached features -> unrolled head must equal model.forward()."""
-    for seed in range(3):
-        fast, slow = random_window(img, seed)
+def _check(label: str, det, ref_det, direction, ref_dir, atol: float):
+    d1, d2 = _max_diff(det, ref_det), _max_diff(direction, ref_dir)
+    print(f"[verify] {label}: det diff {d1:.2e}, dir diff {d2:.2e}")
+    if max(d1, d2) > atol:
+        sys.exit(f"[error] {label} does not match model.forward() — aborting")
+
+
+def plan_simple(model, img: int):
+    wrapper = SimpleWrapper(model).eval()
+    models = [dict(name="SwipeSimple", module=wrapper, example=(torch.zeros(1, 1, img, img),),
+                   inputs=[("frame", (1, 1, img, img))], outputs=["det_logit", "dir_logits"],
+                   description="SimpleSwipeAnnotator: one grayscale frame -> swipe logits",
+                   input_docs={"frame": "grayscale frame, RAW 0..255 (normalised inside the model)"})]
+
+    def samples():
+        g = torch.Generator().manual_seed(0)
+        return [torch.randint(0, 256, (1, 1, img, img), generator=g).float() for _ in range(3)]
+
+    def verify_torch():
+        for i, x in enumerate(samples()):
+            with torch.no_grad():
+                ref = model(x)
+                got = wrapper(x)
+            _check(f"torch parity #{i}", got[0], ref[0], got[1], ref[1], TORCH_ATOL)
+
+    def verify_coreml(paths):
+        import coremltools as ct
+        ml = ct.models.MLModel(paths["SwipeSimple"], compute_units=ct.ComputeUnit.CPU_ONLY)
+        x = samples()[0]
         with torch.no_grad():
-            ref_det, ref_dir = model(fast, slow)
-            f_feats = torch.stack([enc(fast[:, i]) for i in range(FAST_LEN)], dim=1)
-            s_feats = torch.stack([enc(slow[:, i]) for i in range(SLOW_LEN)], dim=1)
-            det, direction = head(f_feats, s_feats)
-        d1 = (det - ref_det).abs().max().item()
-        d2 = (direction - ref_dir).abs().max().item()
-        print(f"[verify] torch parity seed={seed}: det diff {d1:.2e}, dir diff {d2:.2e}")
-        if max(d1, d2) > TORCH_ATOL:
-            sys.exit("[error] exported computation does not match model.forward() — aborting")
+            ref = model(x)
+        out = ml.predict({"frame": x.numpy().astype(np.float32)})
+        _check("Core ML parity", out["det_logit"], ref[0].numpy(), out["dir_logits"], ref[1].numpy(), COREML_ATOL)
+
+    return models, verify_torch, verify_coreml, {}
 
 
-def verify_coreml(enc_path: str, head_path: str, model, img: int):
-    """Run the saved Core ML models (CPU, fp32) and compare to model.forward(). macOS only."""
-    if sys.platform != "darwin":
-        print("[verify] Core ML runtime check skipped (needs macOS)")
-        return
-    import coremltools as ct
+def plan_causal(model, img: int):
+    from model_causal import FAST_LEN, FEAT_DIM, SLOW_OFFSETS
+    slow_len = len(SLOW_OFFSETS)
+    enc = EncoderWrapper(model).eval()
+    head = HeadWrapper(model, FAST_LEN, slow_len).eval()
+    models = [
+        dict(name="SwipeEncoder", module=enc, example=(torch.zeros(1, 2, img, img),),
+             inputs=[("frame", (1, 2, img, img))], outputs=["feat"],
+             description="CausalSwipeAnnotator per-frame CNN encoder",
+             input_docs={"frame": "(gray, diff), RAW 0..255 (normalised inside the model)"}),
+        dict(name="SwipeHead", module=head,
+             example=(torch.zeros(1, FAST_LEN, FEAT_DIM), torch.zeros(1, slow_len, FEAT_DIM)),
+             inputs=[("fast_feats", (1, FAST_LEN, FEAT_DIM)), ("slow_feats", (1, slow_len, FEAT_DIM))],
+             outputs=["det_logit", "dir_logits"],
+             description="CausalSwipeAnnotator windowed head (zero-state GRUs)",
+             input_docs={"fast_feats": "features of ticks [t-7 .. t], oldest first",
+                         "slow_feats": "features of ticks [t-19, t-13], oldest first"}),
+    ]
 
-    enc = ct.models.MLModel(enc_path, compute_units=ct.ComputeUnit.CPU_ONLY)
-    head = ct.models.MLModel(head_path, compute_units=ct.ComputeUnit.CPU_ONLY)
+    def window(seed):
+        g = torch.Generator().manual_seed(seed)
+        return (torch.randint(0, 256, (1, FAST_LEN, 2, img, img), generator=g).float(),
+                torch.randint(0, 256, (1, slow_len, 2, img, img), generator=g).float())
 
-    def feat(frame_t):
-        out = enc.predict({"frame": frame_t.numpy().astype(np.float32)})
-        return np.asarray(out["feat"], dtype=np.float32).reshape(1, FEAT_DIM)
+    def verify_torch():
+        for seed in range(3):
+            fast, slow = window(seed)
+            with torch.no_grad():
+                ref = model(fast, slow)
+                ff = torch.stack([enc(fast[:, i]) for i in range(FAST_LEN)], dim=1)
+                sf = torch.stack([enc(slow[:, i]) for i in range(slow_len)], dim=1)
+                got = head(ff, sf)
+            _check(f"torch parity #{seed}", got[0], ref[0], got[1], ref[1], TORCH_ATOL)
 
-    fast, slow = random_window(img, seed=123)
-    with torch.no_grad():
-        ref_det, ref_dir = model(fast, slow)
+    def verify_coreml(paths):
+        import coremltools as ct
+        e = ct.models.MLModel(paths["SwipeEncoder"], compute_units=ct.ComputeUnit.CPU_ONLY)
+        h = ct.models.MLModel(paths["SwipeHead"], compute_units=ct.ComputeUnit.CPU_ONLY)
 
-    f_feats = np.stack([feat(fast[:, i]) for i in range(FAST_LEN)], axis=1)   # (1, 8, 128)
-    s_feats = np.stack([feat(slow[:, i]) for i in range(SLOW_LEN)], axis=1)   # (1, 2, 128)
-    out = head.predict({"fast_feats": f_feats, "slow_feats": s_feats})
-    det = np.asarray(out["det_logit"], dtype=np.float32).reshape(-1)
-    direction = np.asarray(out["dir_logits"], dtype=np.float32).reshape(1, 4)
+        def feat(x):
+            out = e.predict({"frame": x.numpy().astype(np.float32)})
+            return np.asarray(out["feat"], np.float32).reshape(1, FEAT_DIM)
 
-    d1 = float(np.abs(det - ref_det.numpy().reshape(-1)).max())
-    d2 = float(np.abs(direction - ref_dir.numpy()).max())
-    print(f"[verify] Core ML parity: det diff {d1:.2e}, dir diff {d2:.2e}")
-    if max(d1, d2) > COREML_ATOL:
-        sys.exit("[error] Core ML output does not match model.forward() — aborting")
+        fast, slow = window(123)
+        with torch.no_grad():
+            ref = model(fast, slow)
+        ff = np.stack([feat(fast[:, i]) for i in range(FAST_LEN)], axis=1)
+        sf = np.stack([feat(slow[:, i]) for i in range(slow_len)], axis=1)
+        out = h.predict({"fast_feats": ff, "slow_feats": sf})
+        _check("Core ML parity", out["det_logit"], ref[0].numpy(), out["dir_logits"], ref[1].numpy(), COREML_ATOL)
+
+    extra = {"fast_len": FAST_LEN, "slow_offsets": list(SLOW_OFFSETS), "feat_dim": FEAT_DIM}
+    return models, verify_torch, verify_coreml, extra
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
-def convert(module: nn.Module, example: tuple, inputs: list, outputs: list):
+def convert(spec: dict):
     import coremltools as ct
-
     with torch.no_grad():
-        traced = torch.jit.trace(module, example, check_trace=True)
-    return ct.convert(
+        traced = torch.jit.trace(spec["module"], spec["example"], check_trace=True)
+    ml = ct.convert(
         traced,
-        inputs=[ct.TensorType(name=n, shape=tuple(s), dtype=np.float32) for n, s in inputs],
-        outputs=[ct.TensorType(name=n) for n in outputs],
+        inputs=[ct.TensorType(name=n, shape=s, dtype=np.float32) for n, s in spec["inputs"]],
+        outputs=[ct.TensorType(name=n) for n in spec["outputs"]],
         minimum_deployment_target=ct.target.iOS14,
         convert_to="neuralnetwork",
         compute_units=ct.ComputeUnit.ALL,
     )
+    ml.short_description = spec["description"]
+    for name, doc in spec["input_docs"].items():
+        ml.input_description[name] = doc
+    return ml
+
+
+def pick_threshold(ckpt: dict, args: dict, override):
+    if override is not None:
+        return float(override), "--fire_threshold"
+    if ckpt.get("best_threshold") is not None:
+        return float(ckpt["best_threshold"]), "checkpoint best_threshold (val F1 sweep)"
+    if args.get("det_threshold") is not None:
+        return float(args["det_threshold"]), "checkpoint args.det_threshold"
+    return 0.5, "default"
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--checkpoint", required=True, help="Path to a train_causal.py checkpoint")
-    ap.add_argument("--out_dir", default=".", help="Directory for SwipeEncoder/SwipeHead .mlmodel")
-    ap.add_argument("--img_size", type=int, default=None,
-                    help="Frame H=W (default: checkpoint args, else 128)")
-    ap.add_argument("--skip_verify", action="store_true", help="Skip the Core ML runtime check")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--checkpoint", required=True)
+    ap.add_argument("--out_dir", default="build")
+    ap.add_argument("--img_size", type=int, default=None, help="default: from checkpoint, else 128")
+    ap.add_argument("--tick_hz", type=float, default=None,
+                    help="frame rate of the training videos (default: checkpoint, else 24). "
+                         "The causal model is rate-dependent, so this must be right for it.")
+    ap.add_argument("--fire_threshold", type=float, default=None,
+                    help="detection probability that fires a swipe (default: from checkpoint)")
+    ap.add_argument("--skip_verify", action="store_true", help="skip the Core ML runtime check (macOS)")
     args = ap.parse_args()
 
-    print(f"[1/5] Loading checkpoint: {args.checkpoint}")
-    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if "model_state" not in ckpt or "arch" not in ckpt:
-        sys.exit(f"[error] not a train_causal.py checkpoint; keys: {list(ckpt.keys())}")
-
-    ckpt_args = ckpt.get("args", {})
-    if not isinstance(ckpt_args, dict):
-        ckpt_args = vars(ckpt_args)
-    img = args.img_size or int(ckpt_args.get("img_size", 128))
-    print(f"[info] arch={ckpt['arch']} img_size={img} epoch={ckpt.get('epoch')} "
+    print(f"[1/4] Loading {args.checkpoint}")
+    ckpt, kind, model, ck_args = load_checkpoint(args.checkpoint)
+    img = args.img_size or int(ck_args.get("img_size", 128))
+    tick_hz = args.tick_hz or float(ck_args.get("fps", 24.0))
+    print(f"[info] kind={kind} arch={ckpt.get('arch')} img={img} epoch={ckpt.get('epoch')} "
           f"val_f1={ckpt.get('val_f1')}")
 
-    print("[2/5] Building model")
-    model = build_causal_model(ckpt["arch"])
-    model.load_state_dict(ckpt["model_state"])
-    model.eval()
+    specs, verify_torch, verify_coreml, extra = (plan_simple if kind == "simple" else plan_causal)(model, img)
 
-    enc_w, head_w = EncoderWrapper(model).eval(), HeadWrapper(model).eval()
+    print("[2/4] Verifying the exported computation against model.forward()")
+    verify_torch()
 
-    print("[3/5] Verifying unrolled pipeline against model.forward()")
-    verify_torch_parity(model, enc_w, head_w, img)
-
-    print("[4/5] Converting with coremltools (neuralnetwork)")
-    enc_ml = convert(enc_w, (torch.zeros(1, 2, img, img),),
-                     inputs=[("frame", (1, 2, img, img))], outputs=["feat"])
-    head_ml = convert(head_w, (torch.zeros(1, FAST_LEN, FEAT_DIM), torch.zeros(1, SLOW_LEN, FEAT_DIM)),
-                      inputs=[("fast_feats", (1, FAST_LEN, FEAT_DIM)),
-                              ("slow_feats", (1, SLOW_LEN, FEAT_DIM))],
-                      outputs=["det_logit", "dir_logits"])
-
-    for label, ml in (("SwipeEncoder", enc_ml), ("SwipeHead", head_ml)):
-        spec = ml.get_spec()
-        ins = ", ".join(f"{i.name}:{i.type.multiArrayType.dataType}" for i in spec.description.input)
-        print(f"[info] {label} declared input dtypes (enum): {ins}")
-
-    enc_ml.short_description = "CausalSwipeAnnotator per-frame CNN encoder"
-    enc_ml.input_description["frame"] = "(gray, diff) pair, RAW 0-255 values (normalised inside the model)"
-    enc_ml.output_description["feat"] = "128-d frame feature"
-    head_ml.short_description = "CausalSwipeAnnotator windowed temporal head (zero-state GRUs)"
-    head_ml.input_description["fast_feats"] = "features of frames [t-7 .. t], oldest first"
-    head_ml.input_description["slow_feats"] = "features of frames [t-19, t-13], oldest first"
-    head_ml.output_description["det_logit"] = "sigmoid() -> detection probability at t"
-    head_ml.output_description["dir_logits"] = "softmax() -> [UP, DOWN, LEFT, RIGHT]"
-
+    print("[3/4] Converting (neuralnetwork)")
     os.makedirs(args.out_dir, exist_ok=True)
-    enc_path = os.path.join(args.out_dir, "SwipeEncoder.mlmodel")
-    head_path = os.path.join(args.out_dir, "SwipeHead.mlmodel")
-    print(f"[5/5] Saving {enc_path} and {head_path}")
-    enc_ml.save(enc_path)
-    head_ml.save(head_path)
+    paths = {}
+    for spec in specs:
+        path = os.path.join(args.out_dir, spec["name"] + ".mlmodel")
+        convert(spec).save(path)
+        paths[spec["name"]] = path
+        print(f"[info] wrote {path}")
 
-    if not args.skip_verify:
-        verify_coreml(enc_path, head_path, model, img)
+    if args.skip_verify or sys.platform != "darwin":
+        print("[verify] Core ML runtime check skipped" + ("" if args.skip_verify else " (needs macOS)"))
+    else:
+        verify_coreml(paths)
 
-    print("\nNext: xcrun coremlcompiler compile SwipeEncoder.mlmodel . && "
-          "xcrun coremlcompiler compile SwipeHead.mlmodel .\n"
-          "Ship both .mlmodelc folders next to AIPlayer.dylib.")
+    fire, source = pick_threshold(ckpt, ck_args, args.fire_threshold)
+    config = {
+        "model_type": kind,
+        "models": [s["name"] + ".mlmodelc" for s in specs],
+        "img_size": img,
+        "tick_hz": tick_hz,
+        # Gate: fire once when prob >= fire_threshold, then wait for prob < release_threshold.
+        "fire_threshold": round(fire, 4),
+        "release_threshold": round(fire * 0.5, 4),
+        "min_dir_confidence": 0.0,
+        "cooldown_s": 0.25,
+        # Linear correction applied to the 0..255 gray input before the model
+        # (gray' = gray * input_gain + input_bias). tools/diagnose.py suggests values.
+        "input_gain": 1.0,
+        "input_bias": 0.0,
+        # >0: save this many preprocessed frames + predictions to Documents/AIPlayerDump.
+        "debug_dump_frames": 0,
+        **extra,
+        "source": {"checkpoint": os.path.basename(args.checkpoint), "epoch": ckpt.get("epoch"),
+                   "val_f1": ckpt.get("val_f1"), "fire_threshold_from": source},
+    }
+    cfg_path = os.path.join(args.out_dir, "AIPlayerConfig.json")
+    with open(cfg_path, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"[4/4] wrote {cfg_path} (fire_threshold={fire:.3f} from {source}, tick_hz={tick_hz:g})")
+    print("Next: xcrun coremlcompiler compile <each .mlmodel> <out_dir>; ship the .mlmodelc folders "
+          "and AIPlayerConfig.json next to AIPlayer.dylib.")
 
 
 if __name__ == "__main__":
