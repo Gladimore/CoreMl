@@ -5,7 +5,8 @@
 //     -> fixed-rate tick clock (tick_hz)
 //     -> exact training preprocessing (AIPreprocess.c): antialiased 128x128
 //        resize + torchvision grayscale, NO colour management
-//     -> model ("simple": one frame; "causal": cached CNN features + GRU head)
+//     -> model ("temporal": stack of recent frames; "simple": one frame;
+//               "causal": cached CNN features + GRU head)
 //     -> detection gate (fire once per burst) -> synthesized swipe
 //
 // Everything model-specific comes from AIPlayerConfig.json, written by
@@ -198,11 +199,17 @@ static void AIFillPrediction(float detLogit, const float dirLogits[4], AIPredict
 @property (nonatomic, readonly) NSURL *directory;
 @property (nonatomic, readonly) NSDictionary *raw;
 @property (nonatomic, readonly) BOOL causal;
+@property (nonatomic, readonly) BOOL temporal;
+@property (nonatomic, readonly) NSString *kindName;
+@property (nonatomic, readonly) NSArray<NSNumber *> *frameOffsets;   // temporal only, [0, ...] ticks back
+@property (nonatomic, readonly) NSInteger maxFrameOffset;            // temporal only
+@property (nonatomic, readonly) NSInteger inputChannels;             // simple 1, causal 2, temporal K
 @property (nonatomic, readonly) NSArray<NSString *> *modelFiles;
 @property (nonatomic, readonly) NSInteger imgSize;
 @property (nonatomic, readonly) double tickHz;
 @property (nonatomic, readonly) float fireThreshold, releaseThreshold, minDirConfidence;
 @property (nonatomic, readonly) double cooldown;
+@property (nonatomic, readonly) float rearmDirConfidence;          // >0: a confident NEW direction may fire mid-burst
 @property (nonatomic, readonly) float inputGain, inputBias;
 @property (nonatomic, readonly) NSInteger debugDumpFrames;
 @property (nonatomic, readonly) MLComputeUnits computeUnits;
@@ -308,6 +315,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 
     id type = j[@"model_type"];
     if ([type isEqual:@"causal"]) _causal = YES;
+    else if ([type isEqual:@"temporal"]) _temporal = YES;
     else if (![type isEqual:@"simple"]) {
         if (error) *error = AIError(3, [NSString stringWithFormat:@"unknown model_type '%@'", type]);
         return NO;
@@ -316,7 +324,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     BOOL modelsOK = [models isKindOfClass:[NSArray class]] && models.count == (_causal ? 2u : 1u);
     for (id name in modelsOK ? models : @[]) modelsOK = modelsOK && [name isKindOfClass:[NSString class]];
     if (!modelsOK) {
-        if (error) *error = AIError(4, @"'models' must list 1 (simple) or 2 (causal: encoder, head) .mlmodelc names");
+        if (error) *error = AIError(4, @"'models' must list 1 (simple/temporal) or 2 (causal: encoder, head) .mlmodelc names");
         return NO;
     }
     _modelFiles = models;
@@ -326,7 +334,8 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     _fireThreshold    = (float)AINum(j, @"fire_threshold", 0.6);
     _releaseThreshold = (float)AINum(j, @"release_threshold", _fireThreshold * 0.5);
     _minDirConfidence = (float)AINum(j, @"min_dir_confidence", 0);
-    _cooldown         = AINum(j, @"cooldown_s", 0.25);
+    _cooldown         = AINum(j, @"cooldown_s", 0.15);
+    _rearmDirConfidence = (float)AINum(j, @"rearm_dir_confidence", 0.6);
     _inputGain        = (float)AINum(j, @"input_gain", 1);
     _inputBias        = (float)AINum(j, @"input_bias", 0);
     _debugDumpFrames  = (NSInteger)AINum(j, @"debug_dump_frames", 0);
@@ -341,6 +350,26 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
         if (error) *error = AIError(5, @"AIPlayerConfig.json values out of range "
                                         "(img_size, tick_hz, or release_threshold > fire_threshold)");
         return NO;
+    }
+
+    _kindName = _causal ? @"causal" : (_temporal ? @"temporal" : @"simple");
+    _inputChannels = _causal ? 2 : 1;
+    if (_temporal) {
+        NSArray *offs = j[@"frame_offsets"];
+        BOOL ok = [offs isKindOfClass:[NSArray class]] && offs.count >= 1 && [offs.firstObject isEqual:@0];
+        NSMutableSet *seen = [NSMutableSet set];
+        for (id o in ok ? offs : @[]) {
+            ok = ok && [o isKindOfClass:[NSNumber class]] && [o integerValue] >= 0 && [o integerValue] <= 240 &&
+                 ![seen containsObject:o];
+            [seen addObject:o];
+            _maxFrameOffset = MAX(_maxFrameOffset, [o integerValue]);
+        }
+        if (!ok) {
+            if (error) *error = AIError(7, @"'frame_offsets' must be unique ints >= 0 starting with 0");
+            return NO;
+        }
+        _frameOffsets = offs;
+        _inputChannels = (NSInteger)offs.count;
     }
 
     if (_causal) {
@@ -399,6 +428,8 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     uint8_t    *_gray, *_prevGray;
     BOOL        _hasPrev;
     float      *_stage;                        // model input staging (float32)
+    uint8_t    *_grayRing;                     // temporal: last max_offset+1 gray frames, one per tick
+    NSInteger   _grayRingLen;
 
     // causal feature ring
     NSInteger _history, _tick;
@@ -427,7 +458,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 
     _gray     = calloc((size_t)_pixels, 1);
     _prevGray = calloc((size_t)_pixels, 1);
-    _stage    = calloc((size_t)_pixels * (config.causal ? 2 : 1), sizeof(float));
+    _stage    = calloc((size_t)(_pixels * config.inputChannels), sizeof(float));
     if (!_gray || !_prevGray || !_stage) {
         if (error) *error = AIError(20, @"out of memory");
         return nil;
@@ -435,14 +466,14 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     if (![self _loadModels:error]) return nil;
     [self _resetLocked];
     AILog("Loaded %{public}@ model from %{public}@ (img %ld, %.0f Hz, fire %.2f / release %.2f)",
-          config.causal ? @"causal" : @"simple", config.directory.path, (long)_S, config.tickHz,
+          config.kindName, config.directory.path, (long)_S, config.tickHz,
           config.fireThreshold, config.releaseThreshold);
     return self;
 }
 
 - (void)dealloc {
     if (_hasResampler) AIResamplerFree(&_resampler);
-    free(_rgba); free(_gray); free(_prevGray); free(_stage);
+    free(_rgba); free(_gray); free(_prevGray); free(_stage); free(_grayRing);
     free(_ring); free(_fastBuf); free(_slowBuf);
 }
 
@@ -456,15 +487,24 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 }
 
 - (BOOL)_loadModels:(NSError **)error {
-    NSArray<NSNumber *> *frameShape = @[@1, @(_cfg.causal ? 2 : 1), @(_S), @(_S)];
+    NSArray<NSNumber *> *frameShape = @[@1, @(_cfg.inputChannels), @(_S), @(_S)];
+    NSString *inputName = _cfg.temporal ? @"frames" : @"frame";
     _model = [self _open:_cfg.modelFiles[0] error:error];
     if (!_model) return NO;
-    _in = AIInputArray(_model, @"frame", frameShape, error);
+    _in = AIInputArray(_model, inputName, frameShape, error);
     if (!_in) return NO;
     _provider = [[MLDictionaryFeatureProvider alloc]
-        initWithDictionary:@{ @"frame": [MLFeatureValue featureValueWithMultiArray:_in] } error:error];
+        initWithDictionary:@{ inputName: [MLFeatureValue featureValueWithMultiArray:_in] } error:error];
     if (!_provider) return NO;
 
+    if (_cfg.temporal) {
+        _grayRingLen = _cfg.maxFrameOffset + 1;
+        _grayRing = calloc((size_t)(_grayRingLen * _pixels), 1);
+        if (!_grayRing) {
+            if (error) *error = AIError(20, @"out of memory");
+            return NO;
+        }
+    }
     if (!_cfg.causal) return AIHasOutputs(_model, @[@"det_logit", @"dir_logits"], error);
 
     if (!AIHasOutputs(_model, @[@"feat"], error)) return NO;
@@ -502,6 +542,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     _tick = 0;
     _hasPrev = NO;
     if (_ring) memset(_ring, 0, sizeof(float) * (size_t)(_history * _cfg.featDim));
+    if (_grayRing) memset(_grayRing, 0, (size_t)(_grayRingLen * _pixels));
 }
 
 - (void)copyLastGray:(uint8_t *)dst {
@@ -518,8 +559,9 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     BOOL produced = NO;
     CFTimeInterval t0 = CACurrentMediaTime();
     if ([self _preprocess:pixelBuffer orientation:orientation]) {
-        produced = _cfg.causal ? [self _causalStepHeld:NO prediction:out]
-                               : [self _simplePredict:out];
+        produced = _cfg.causal   ? [self _causalStepHeld:NO prediction:out]
+                 : _cfg.temporal ? [self _temporalStepHeld:NO prediction:out]
+                                 : [self _simplePredict:out];
     }
     _lastInferenceMs = (CACurrentMediaTime() - t0) * 1000.0;
     [_lock unlock];
@@ -529,6 +571,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 - (void)ingestHeldFrame {
     [_lock lock];
     if (_cfg.causal && _hasPrev) [self _causalStepHeld:YES prediction:NULL];
+    if (_cfg.temporal && _hasPrev) [self _temporalStepHeld:YES prediction:NULL];
     [_lock unlock];
 }
 
@@ -605,6 +648,28 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 - (BOOL)_simplePredict:(AIPrediction *)out {
     for (NSInteger i = 0; i < _pixels; i++) _stage[i] = (float)_gray[i];
     AIFillArray(_in, _stage, _pixels);
+    NSError *error = nil;
+    id<MLFeatureProvider> result = [_model predictionFromFeatures:_provider error:&error];
+    return [self _readHeads:result error:error into:out];
+}
+
+// Push this tick's gray frame into the ring (a held tick repeats the previous frame,
+// as in training's "held" augmentation); once max_offset+1 ticks are in and `out` is
+// given, stack frames[t - offset] for each offset (newest first) and predict.
+- (BOOL)_temporalStepHeld:(BOOL)held prediction:(AIPrediction *)out {
+    memcpy(_grayRing + (_tick % _grayRingLen) * _pixels, _gray, (size_t)_pixels);
+    _tick++;
+    if (!held) _hasPrev = YES;
+    if (!out || _tick < _grayRingLen) return NO;
+
+    NSInteger k = 0;
+    for (NSNumber *offset in _cfg.frameOffsets) {
+        const uint8_t *src = _grayRing + ((_tick - 1 - offset.integerValue) % _grayRingLen) * _pixels;
+        float *dst = _stage + k * _pixels;
+        for (NSInteger i = 0; i < _pixels; i++) dst[i] = (float)src[i];
+        k++;
+    }
+    AIFillArray(_in, _stage, k * _pixels);
     NSError *error = nil;
     id<MLFeatureProvider> result = [_model predictionFromFeatures:_provider error:&error];
     return [self _readHeads:result error:error into:out];
@@ -1047,6 +1112,9 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     CFTimeInterval _nextTick;
     BOOL _armed;
     CFTimeInterval _lastFire;
+    AISwipeDirection _lastDirection;
+    BOOL _hasFired;
+    AISwipeDirection _prevPredDirection;   // previous tick's argmax, for the re-arm stability check
     CFTimeInterval _statsStart;
     NSInteger _statFrames, _statTicks, _statPreds, _statFires;
     double _statDetSum;
@@ -1166,6 +1234,8 @@ static void AISetTouchObject(UITouch *touch, id value, NSString *key, NSString *
     _nextTick = 0;
     _armed = NO;                                   // must see a low probability before the first fire
     _lastFire = 0;
+    _hasFired = NO;
+    _prevPredDirection = (AISwipeDirection)-1;
     _statsStart = 0;
     _statFrames = _statTicks = _statPreds = _statFires = 0;
     _statDetSum = 0;
@@ -1238,21 +1308,32 @@ static CGImagePropertyOrientation AIBufferOrientation(CMSampleBufferRef buffer) 
     [_dump appendGray:_dumpGray held:held prediction:p fired:fired];
 }
 
-// Fires at most once per detection burst: prob must drop below release_threshold
-// before the next prob >= fire_threshold can fire again.
+// Fires once per detection burst: after a fire, prob must drop below
+// release_threshold before the same move can fire again. A different move
+// predicted with dirConfidence >= rearm_dir_confidence on two consecutive ticks
+// may fire mid-burst (after the cooldown), so quick combos like LEFT -> UP are
+// not swallowed, while a flickering argmax can't double-fire.
+// tools/diagnose.py replays this exact logic to pick fire_threshold.
 - (BOOL)_handlePrediction:(AIPrediction)p {
     _statPreds++;
     _statDetSum += p.detProbability;
     if (p.detProbability > _statDetMax) _statDetMax = p.detProbability;
 
+    BOOL stableDirection = p.direction == _prevPredDirection;
+    _prevPredDirection = p.direction;
     if (p.detProbability < _config.releaseThreshold) _armed = YES;
-    if (!_armed || p.detProbability < _config.fireThreshold) return NO;
+    if (p.detProbability < _config.fireThreshold) return NO;
     if (p.dirConfidence < _config.minDirConfidence) return NO;
+    BOOL newMove = _hasFired && stableDirection && p.direction != _lastDirection &&
+                   _config.rearmDirConfidence > 0 && p.dirConfidence >= _config.rearmDirConfidence;
+    if (!_armed && !newMove) return NO;
 
     CFTimeInterval now = CACurrentMediaTime();
     if (now - _lastFire < _config.cooldown) return NO;
     _lastFire = now;
     _armed = NO;
+    _hasFired = YES;
+    _lastDirection = p.direction;
     _statFires++;
     [[AISwipeInjector shared] swipeInDirection:p.direction];
     return YES;

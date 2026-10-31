@@ -7,6 +7,11 @@ convert_to_coreml.py — turn a training checkpoint into what AIPlayer.dylib loa
 
 The checkpoint kind is detected from its weights:
 
+  temporal (train_temporal.py / TemporalSwipeNet) -> one model
+      SwipeTemporal.mlmodel frames (1,K,H,W) gray at tick offsets e.g. [0,1,2,4,8]
+                            (index 0 = newest), raw 0..255 -> det_logit (1,), dir_logits (1,4)
+      The device keeps a ring of the last max(offset)+1 frames on the training clock.
+
   simple  (train_simple.py / SimpleSwipeAnnotator) -> one model
       SwipeSimple.mlmodel   frame (1,1,H,W) gray, raw 0..255 -> det_logit (1,), dir_logits (1,4)
 
@@ -51,9 +56,11 @@ COREML_ATOL = 2e-2      # Core ML (CPU) vs. model.forward()
 def detect_kind(state: dict) -> str:
     if any(k.startswith("fast_gru.") for k in state):
         return "causal"
+    if "squeeze.0.weight" in state:
+        return "temporal"
     if "trunk.0.weight" in state:
         return "simple"
-    sys.exit("[error] unrecognised checkpoint: expected SimpleSwipeAnnotator or CausalSwipeAnnotator weights")
+    sys.exit("[error] unrecognised checkpoint: expected Simple/Temporal/CausalSwipeAnnotator weights")
 
 
 def load_checkpoint(path: str):
@@ -70,6 +77,9 @@ def load_checkpoint(path: str):
     if kind == "simple":
         from model_simple import build_simple_model
         model = build_simple_model(arch)
+    elif kind == "temporal":
+        from model_temporal import build_temporal_model
+        model = build_temporal_model(arch)
     else:
         from model_causal import build_causal_model
         model = build_causal_model(arch)
@@ -183,6 +193,48 @@ def plan_simple(model, img: int):
     return models, verify_torch, verify_coreml, {}
 
 
+class TemporalWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, frames):
+        m = self.model
+        h = m.trunk(m.squeeze(m.features(frames * (1.0 / 255.0))))
+        return m.det_head(h).squeeze(-1), m.dir_head(h)
+
+
+def plan_temporal(model, img: int):
+    k = len(model.offsets)
+    wrapper = TemporalWrapper(model).eval()
+    models = [dict(name="SwipeTemporal", module=wrapper, example=(torch.zeros(1, k, img, img),),
+                   inputs=[("frames", (1, k, img, img))], outputs=["det_logit", "dir_logits"],
+                   description="TemporalSwipeNet: stacked grayscale frames -> swipe logits",
+                   input_docs={"frames": f"grayscale frames at tick offsets {list(model.offsets)} "
+                                         "(index 0 = newest), RAW 0..255"})]
+
+    def samples():
+        g = torch.Generator().manual_seed(0)
+        return [torch.randint(0, 256, (1, k, img, img), generator=g).float() for _ in range(3)]
+
+    def verify_torch():
+        for i, x in enumerate(samples()):
+            with torch.no_grad():
+                ref, got = model(x), wrapper(x)
+            _check(f"torch parity #{i}", got[0], ref[0], got[1], ref[1], TORCH_ATOL)
+
+    def verify_coreml(paths):
+        import coremltools as ct
+        ml = ct.models.MLModel(paths["SwipeTemporal"], compute_units=ct.ComputeUnit.CPU_ONLY)
+        x = samples()[0]
+        with torch.no_grad():
+            ref = model(x)
+        out = ml.predict({"frames": x.numpy().astype(np.float32)})
+        _check("Core ML parity", out["det_logit"], ref[0].numpy(), out["dir_logits"], ref[1].numpy(), COREML_ATOL)
+
+    return models, verify_torch, verify_coreml, {"frame_offsets": list(model.offsets)}
+
+
 def plan_causal(model, img: int):
     from model_causal import FAST_LEN, FEAT_DIM, SLOW_OFFSETS
     slow_len = len(SLOW_OFFSETS)
@@ -264,7 +316,7 @@ def pick_threshold(ckpt: dict, args: dict, override):
     if override is not None:
         return float(override), "--fire_threshold"
     if ckpt.get("best_threshold") is not None:
-        return float(ckpt["best_threshold"]), "checkpoint best_threshold (val F1 sweep)"
+        return float(ckpt["best_threshold"]), "checkpoint best_threshold (validation sweep)"
     if args.get("det_threshold") is not None:
         return float(args["det_threshold"]), "checkpoint args.det_threshold"
     return 0.5, "default"
@@ -276,8 +328,9 @@ def main():
     ap.add_argument("--out_dir", default="build")
     ap.add_argument("--img_size", type=int, default=None, help="default: from checkpoint, else 128")
     ap.add_argument("--tick_hz", type=float, default=None,
-                    help="frame rate of the training videos (default: checkpoint, else 24). "
-                         "The causal model is rate-dependent, so this must be right for it.")
+                    help="how often the device evaluates a frame. causal: must equal the training "
+                         "video frame rate (default: checkpoint, else 24). simple: no temporal "
+                         "dependence, so higher just means lower latency (default 30)")
     ap.add_argument("--fire_threshold", type=float, default=None,
                     help="detection probability that fires a swipe (default: from checkpoint)")
     ap.add_argument("--skip_verify", action="store_true", help="skip the Core ML runtime check (macOS)")
@@ -286,11 +339,12 @@ def main():
     print(f"[1/4] Loading {args.checkpoint}")
     ckpt, kind, model, ck_args = load_checkpoint(args.checkpoint)
     img = args.img_size or int(ck_args.get("img_size", 128))
-    tick_hz = args.tick_hz or float(ck_args.get("fps", 24.0))
+    tick_hz = args.tick_hz or (30.0 if kind == "simple" else float(ck_args.get("fps", 24.0)))
     print(f"[info] kind={kind} arch={ckpt.get('arch')} img={img} epoch={ckpt.get('epoch')} "
           f"val_f1={ckpt.get('val_f1')}")
 
-    specs, verify_torch, verify_coreml, extra = (plan_simple if kind == "simple" else plan_causal)(model, img)
+    plan = {"simple": plan_simple, "temporal": plan_temporal, "causal": plan_causal}[kind]
+    specs, verify_torch, verify_coreml, extra = plan(model, img)
 
     print("[2/4] Verifying the exported computation against model.forward()")
     verify_torch()
@@ -315,11 +369,14 @@ def main():
         "models": [s["name"] + ".mlmodelc" for s in specs],
         "img_size": img,
         "tick_hz": tick_hz,
-        # Gate: fire once when prob >= fire_threshold, then wait for prob < release_threshold.
+        # Gate: fire once when prob >= fire_threshold, then wait for prob < release_threshold,
+        # except that a different move with dir confidence >= rearm_dir_confidence may fire
+        # mid-burst (0 disables). tools/diagnose.py --dataset_dir calibrates fire_threshold.
         "fire_threshold": round(fire, 4),
         "release_threshold": round(fire * 0.5, 4),
         "min_dir_confidence": 0.0,
-        "cooldown_s": 0.25,
+        "rearm_dir_confidence": 0.6,
+        "cooldown_s": 0.15,
         # Linear correction applied to the 0..255 gray input before the model
         # (gray' = gray * input_gain + input_bias). tools/diagnose.py suggests values.
         "input_gain": 1.0,

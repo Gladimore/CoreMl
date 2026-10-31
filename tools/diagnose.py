@@ -17,6 +17,8 @@ It answers three questions:
      difference it prints input_gain / input_bias for AIPlayerConfig.json.)
   C. Is the model more trigger-happy on device frames than on training frames?
      (Mean detection probability and the share of frames above fire_threshold.)
+  D. Which fire_threshold makes the AI swipe about as often as you did in the
+     recordings? Replays the exact on-device gate over the dump at each threshold.
 """
 
 import argparse
@@ -79,6 +81,15 @@ def torch_probs(kind, model, frames, held, cfg, want):
             out.append(torch.sigmoid(model(x)[0]))
         return torch.cat(out).numpy() if out else np.zeros(0)
 
+    if kind == "temporal":                       # device ring: frames[t - offset], newest first
+        offs = [int(o) for o in cfg.get("frame_offsets", [0, 1, 2, 4, 8])]
+        out = []
+        for i in range(0, len(want), 256):
+            ts = np.asarray(want[i:i + 256])
+            x = torch.from_numpy(np.stack([frames[ts - o] for o in offs], 1).astype(np.float32))
+            out.append(torch.sigmoid(model(x)[0]))
+        return torch.cat(out).numpy() if out else np.zeros(0)
+
     # causal: rebuild (gray, diff) per tick exactly like the device, then windows
     fast_len = int(cfg.get("fast_len", 8))
     slow = [int(o) for o in cfg.get("slow_offsets", [19, 13])]
@@ -105,7 +116,10 @@ def training_probs(kind, model, train, cfg, n=1500, seed=0):
     if kind == "simple":
         idx = np.sort(rng.choice(len(train), size=min(n, len(train)), replace=False))
         return torch_probs(kind, model, np.asarray(train[idx]), np.zeros(len(idx), bool), cfg, list(range(len(idx))))
-    span = max(int(cfg.get("fast_len", 8)), max(cfg.get("slow_offsets", [19, 13])) + 1)
+    if kind == "temporal":
+        span = max(cfg.get("frame_offsets", [0, 1, 2, 4, 8]))
+    else:
+        span = max(int(cfg.get("fast_len", 8)), max(cfg.get("slow_offsets", [19, 13])) + 1)
     out = []
     for t in rng.integers(span, len(train), size=min(n // 4, 400)):
         clip = np.asarray(train[t - span: t + 1])
@@ -136,12 +150,43 @@ def save_side_by_side(device, train, path, n=6):
     print(f"  wrote {path}  (top: device, bottom: training)")
 
 
+def simulate_gate(rows, tick_hz, fire, release, cooldown, rearm_conf, min_dir_conf=0.0):
+    """Replays AIPlayer.m's _handlePrediction over a dump. Returns the number of fires."""
+    armed, has_fired, last_dir, last_fire, fires, prev_dir = False, False, -1, -1e9, 0, -2
+    for r in rows:
+        if not r["has_pred"]:
+            continue
+        p, dirs = r["det"], r["dirs"]
+        d = int(np.nanargmax(dirs)) if not np.all(np.isnan(dirs)) else -1
+        conf = float(np.nanmax(dirs)) if d >= 0 else 0.0
+        stable, prev_dir = d == prev_dir, d
+        if p < release:
+            armed = True
+        if p < fire or conf < min_dir_conf:
+            continue
+        new_move = has_fired and stable and d != last_dir and rearm_conf > 0 and conf >= rearm_conf
+        if not armed and not new_move:
+            continue
+        now = r["tick"] / tick_hz
+        if now - last_fire < cooldown:
+            continue
+        last_fire, armed, has_fired, last_dir, fires = now, False, True, d, fires + 1
+    return fires
+
+
+def human_swipe_rate(dataset_dir, fps):
+    import pandas as pd
+    mf = pd.read_csv(os.path.join(dataset_dir, "manifest.csv"), usecols=["has_action"])
+    return mf["has_action"].sum() / (len(mf) / fps)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dump", required=True)
     ap.add_argument("--checkpoint", required=True)
     ap.add_argument("--dataset_dir", default=None, help="training dataset (frames.bin + meta.npz)")
     ap.add_argument("--out", default=None, help="where to write the PNG (default: the dump folder)")
+    ap.add_argument("--dataset_fps", type=float, default=24.0, help="frame rate of the training videos")
     a = ap.parse_args()
 
     cfg, frames, rows = load_dump(a.dump)
@@ -219,6 +264,33 @@ def main():
             print("  -> the model fires far more on device frames than on training frames: a domain shift"
                   " (section B), not bad luck. A model trained with label-dependent augmentation"
                   " (the old loader) is especially sensitive to this.")
+
+    # ── D: pick fire_threshold so the AI swipes about as often as you do ──────
+    print("\nD. fire_threshold calibration (replays the on-device gate over this dump)")
+    n_pred = sum(r["has_pred"] for r in rows)
+    secs = len(rows) / fps
+    if n_pred < 10 * fps:
+        print(f"  need >= 10 s of predictions during an actual run (have {n_pred / fps:.1f} s); "
+              f"set debug_dump_frames to {int(40 * fps)} and keep the AI on mid-run")
+        return
+    ratio = float(cfg.get("release_threshold", fire / 2)) / max(fire, 1e-6)
+    cool = float(cfg.get("cooldown_s", 0.15))
+    rearm = float(cfg.get("rearm_dir_confidence", 0.0))
+    target = human_swipe_rate(a.dataset_dir, a.dataset_fps) if a.dataset_dir else None
+    if target:
+        print(f"  you swipe {target:.2f}/s in the training recordings")
+    best = None
+    for th in np.round(np.arange(0.10, 0.91, 0.05), 2):
+        rate = simulate_gate(rows, fps, th, th * ratio, cool, rearm,
+                             float(cfg.get("min_dir_confidence", 0))) / secs
+        mark = " <- current" if abs(th - fire) < 0.025 else ""
+        print(f"  fire_threshold {th:.2f}: {rate:5.2f} swipes/s{mark}")
+        if target and (best is None or abs(rate - target) <= abs(best[1] - target)):   # ties -> higher threshold
+            best = (th, rate)
+    if best:
+        print(f"  -> closest to your own rate: \"fire_threshold\": {best[0]:.2f}, "
+              f"\"release_threshold\": {best[0] * ratio:.2f}  ({best[1]:.2f} swipes/s)")
+        print("     A threshold that only matches your rate by firing at random is no good: check the run.")
 
 
 if __name__ == "__main__":
