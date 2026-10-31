@@ -13,8 +13,12 @@ AIPlayer.m + AIPreprocess.c ──Theos──▶ AIPlayer.dylib
 1. Put the checkpoint you want at `checkpoints/best.pt`. Both kinds work, and the converter detects which one it is:
    - **simple**: `train_simple.py` / `SimpleSwipeAnnotator`, one grayscale frame
    - **causal**: `train_causal.py` / `CausalSwipeAnnotator`, an 8+2-frame GRU window
-2. Push. CI tests the preprocessing, converts the checkpoint, checks Core ML against PyTorch, compiles everything and uploads `AIPlayer-dylib` and `AIPlayer-models`.
-3. Unzip `AIPlayerModels.zip`. In Sideloadly, inject `AIPlayer.dylib`, `AIPlayerConfig.json` and every `.mlmodelc` folder side by side.
+2. Push. CI tests the preprocessing, converts the checkpoint, checks Core ML against PyTorch, compiles everything and uploads `AIPlayer-dylib` and `AIPlayer-bundle`.
+3. Unzip `AIPlayerBundle.zip` to get `AIPlayer.bundle`, which holds `AIPlayerConfig.json`, the `.mlmodelc` folder(s) and an `Info.plist`. In Sideloadly, inject both `AIPlayer.dylib` and `AIPlayer.bundle`.
+
+The dylib looks for `AIPlayer.bundle` next to itself, in the app's root and in `Frameworks/`, then searches the app a few levels deep. If the models aren't found, the device log says where it looked (`AIPlayer` subsystem `com.aiplayer.tweak`).
+
+To change a setting such as `fire_threshold` without rebuilding, edit `AIPlayer.bundle/AIPlayerConfig.json` before injecting.
 
 ## AIPlayerConfig.json
 

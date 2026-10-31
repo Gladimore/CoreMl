@@ -250,23 +250,30 @@ static NSString *AIFindConfigDirectory(void) {
     NSString *dylibDir  = AIDylibDirectory();
     NSString *bundleDir = [NSBundle mainBundle].bundlePath;
 
+    // Sideloadly injects AIPlayer.bundle (config + models) either next to the dylib
+    // (usually App.app/Frameworks) or in the app's root; check both, then loose files.
     NSMutableArray<NSString *> *bases = [NSMutableArray array];
     if (dylibDir) {
-        [bases addObject:dylibDir];
         [bases addObject:[dylibDir stringByAppendingPathComponent:@"AIPlayer.bundle"]];
+        [bases addObject:[[dylibDir stringByDeletingLastPathComponent]
+                          stringByAppendingPathComponent:@"AIPlayer.bundle"]];
+        [bases addObject:dylibDir];
     }
     if (bundleDir) {
+        [bases addObject:[bundleDir stringByAppendingPathComponent:@"AIPlayer.bundle"]];
+        [bases addObject:[bundleDir stringByAppendingPathComponent:@"Frameworks/AIPlayer.bundle"]];
+        [bases addObject:[bundleDir stringByAppendingPathComponent:@"PlugIns/AIPlayer.bundle"]];
         [bases addObject:bundleDir];
         [bases addObject:[bundleDir stringByAppendingPathComponent:@"Frameworks"]];
-        [bases addObject:[bundleDir stringByAppendingPathComponent:@"Frameworks/AIPlayer.bundle"]];
     }
     for (NSString *base in bases) {
         if ([fm fileExistsAtPath:[base stringByAppendingPathComponent:kConfigFileName]]) return base;
     }
+    // Fallback: a renamed bundle anywhere a few levels deep in the app.
     NSString *found = bundleDir ? AIFindFileNamed(kConfigFileName, bundleDir, 4) : nil;
     if (found) return [found stringByDeletingLastPathComponent];
     AILog("%{public}@ not found (searched dylib dir %{public}@ and app bundle %{public}@). "
-          "Inject it and the .mlmodelc folders next to AIPlayer.dylib.",
+          "Inject AIPlayer.bundle alongside AIPlayer.dylib.",
           kConfigFileName, dylibDir ?: @"(nil)", bundleDir ?: @"(nil)");
     return nil;
 }

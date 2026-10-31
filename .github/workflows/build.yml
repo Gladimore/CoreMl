@@ -108,18 +108,39 @@ jobs:
           path: ${{ steps.find_dylib.outputs.dylib_path }}
           if-no-files-found: error
 
-      # AIPlayerConfig.json + every .mlmodelc it lists. Unzip, then add ALL of it
-      # in Sideloadly next to AIPlayer.dylib.
-      - name: Package models for Sideloadly
+      # Sideloadly only injects dylibs / frameworks / bundles, so the config and
+      # every .mlmodelc it lists go inside AIPlayer.bundle. The Info.plist makes it
+      # a real resource bundle; without one, code signing rejects the folder.
+      - name: Package AIPlayer.bundle for Sideloadly
         run: |
           set -euo pipefail
-          cd build
-          zip -r ../AIPlayerModels.zip AIPlayerConfig.json *.mlmodelc
-          unzip -l ../AIPlayerModels.zip | head -40
+          rm -rf AIPlayer.bundle
+          mkdir AIPlayer.bundle
+          cp build/AIPlayerConfig.json AIPlayer.bundle/
+          cp -R build/*.mlmodelc AIPlayer.bundle/
+          cat > AIPlayer.bundle/Info.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleIdentifier</key>            <string>com.aiplayer.models</string>
+            <key>CFBundleName</key>                  <string>AIPlayer</string>
+            <key>CFBundlePackageType</key>           <string>BNDL</string>
+            <key>CFBundleInfoDictionaryVersion</key> <string>6.0</string>
+            <key>CFBundleShortVersionString</key>    <string>1.0</string>
+            <key>CFBundleVersion</key>               <string>${{ github.run_number }}</string>
+          </dict>
+          </plist>
+          PLIST
+          plutil -lint AIPlayer.bundle/Info.plist
+          # Every model the config lists must be inside the bundle.
+          python -c "import json,os,sys; c=json.load(open('AIPlayer.bundle/AIPlayerConfig.json')); m=[x for x in c['models'] if not os.path.isdir('AIPlayer.bundle/'+x)]; sys.exit('missing in bundle: %s' % m if m else 0)"
+          zip -r AIPlayerBundle.zip AIPlayer.bundle
+          unzip -l AIPlayerBundle.zip | head -40
 
-      - name: Upload models (for Sideloadly injection)
+      - name: Upload AIPlayer.bundle (for Sideloadly injection)
         uses: actions/upload-artifact@v4
         with:
-          name: AIPlayer-models
-          path: AIPlayerModels.zip
+          name: AIPlayer-bundle
+          path: AIPlayerBundle.zip
           if-no-files-found: error
