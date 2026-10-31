@@ -36,8 +36,20 @@ def load_dump(path: str):
     with open(os.path.join(path, "config.json")) as f:
         cfg = json.load(f)
     S = int(cfg.get("img_size", 128))
-    raw = np.fromfile(os.path.join(path, "frames.u8"), dtype=np.uint8)
-    frames = raw[: (raw.size // (S * S)) * S * S].reshape(-1, S, S)
+    b64_path = os.path.join(path, "frames.b64")
+    if os.path.exists(b64_path):                      # current format: one base64 frame per line
+        import base64
+        with open(b64_path) as f:
+            frames = [np.frombuffer(base64.b64decode(line.strip()), np.uint8)
+                      for line in f if line.strip()]
+        frames = np.stack([fr for fr in frames if fr.size == S * S]).reshape(-1, S, S)
+    else:                                             # older builds: raw binary
+        raw = np.fromfile(os.path.join(path, "frames.u8"), dtype=np.uint8)
+        if raw.size >= 30 and (raw[:30].reshape(-1, 3) == [0xEF, 0xBF, 0xBD]).all(axis=1).mean() > 0.5:
+            sys.exit("[error] frames.u8 was corrupted in transfer: something treated it as text and "
+                     "replaced every byte >= 128 with U+FFFD. Use a build that writes frames.b64, or copy "
+                     "the file with a binary-safe method (Finder/iTunes file sharing, AirDrop of the folder).")
+        frames = raw[: (raw.size // (S * S)) * S * S].reshape(-1, S, S)
     rows = []
     with open(os.path.join(path, "ticks.csv")) as f:
         next(f)

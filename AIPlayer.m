@@ -655,7 +655,9 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
 //
 // With "debug_dump_frames": N in the config, the first N ticks after AI ON are
 // written to Documents/AIPlayerDump/<time>/:
-//   frames.u8   N x img x img uint8, exactly what the model saw
+//   frames.b64  one line per tick: base64 of the img x img uint8 model input.
+//               Text on purpose: binary files get mangled by apps/transfers that
+//               treat them as text (every byte >= 128 becomes U+FFFD).
 //   ticks.csv   tick,held,has_pred,det_prob,p_up,p_down,p_left,p_right,fired
 //   config.json the config in use
 // tools/diagnose.py compares these against PyTorch and the training frames.
@@ -684,7 +686,7 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm createDirectoryAtPath:_dir withIntermediateDirectories:YES attributes:nil error:nil]) return nil;
 
-    NSString *framesPath = [_dir stringByAppendingPathComponent:@"frames.u8"];
+    NSString *framesPath = [_dir stringByAppendingPathComponent:@"frames.b64"];
     NSString *csvPath = [_dir stringByAppendingPathComponent:@"ticks.csv"];
     [fm createFileAtPath:framesPath contents:nil attributes:nil];
     [fm createFileAtPath:csvPath
@@ -711,7 +713,8 @@ static double AINum(NSDictionary *d, NSString *key, double fallback) {
     if (_count >= _limit) return;
     NSInteger tick = _count++;
     BOOL last = _count == _limit;
-    NSData *frame = [NSData dataWithBytes:gray length:(NSUInteger)_pixels];
+    NSString *b64 = [[NSData dataWithBytes:gray length:(NSUInteger)_pixels] base64EncodedStringWithOptions:0];
+    NSData *frame = [[b64 stringByAppendingString:@"\n"] dataUsingEncoding:NSUTF8StringEncoding];
     NSString *line = p
         ? [NSString stringWithFormat:@"%ld,%d,1,%.6f,%.6f,%.6f,%.6f,%.6f,%d\n", (long)tick, held,
            p->detProbability, p->dirProbs[0], p->dirProbs[1], p->dirProbs[2], p->dirProbs[3], fired]

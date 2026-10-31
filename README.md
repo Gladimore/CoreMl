@@ -50,6 +50,8 @@ The script reports:
 - whether the model fires more on device frames than on training frames
 - the `input_gain`/`input_bias` values that correct a global brightness shift
 
+Dumps are written as `frames.b64` (base64 text, one frame per line), so they survive apps that treat files as text. A raw binary dump gets mangled that way: every byte ≥128 becomes U+FFFD.
+
 `python tools/test_preprocess.py` proves that `AIPreprocess.c` is bit-exact with the dataset builder. CI runs it too.
 
 ## What changed and why ("fires randomly")
@@ -66,6 +68,7 @@ The script reports:
 - Buffer orientation from ReplayKit is honoured, and a debug dump plus `diagnose.py` were added.
 
 **Training** (`training/`, or `training/sub-3-fixed.ipynb`). Retraining is needed for these.
+- **The model learned to recognise swipes, not to make them (it copies the player).** `swipes.csv` labels the frame where the touch happened, and the game already shows the move starting on or right after that frame. A single-frame model therefore learns "the character is starting to move left, so LEFT". On device it fires only right after *you* swipe, in the same direction, and never on its own. The suspiciously high single-frame `dir_acc` (~0.95) is the giveaway. Fix: `--label_lead N` moves every positive N frames *before* the swipe. The still-pre-reaction frames in between are dropped, and frames showing the reaction stay negative. Measure first with `python tools/label_timing.py --dataset_dir <dataset>`, which prints the exact `--label_lead` / `--react_delay` to use. Expect a lower val F1 afterwards: the old number was inflated by this leak.
 - **Label leak in augmentation (most likely root cause).** The old loader brightness/contrast-jittered *only swipe frames* (`if is_action and rand < 0.7`). The model learns "the image looks re-exposed, so swipe". Validation is never augmented, so the metrics look fine. On device, any global intensity difference against the recordings then raises the detection probability across the board. Jitter is now applied independently of the label.
 - **Validation sampled with replacement.** The weighted sampler drew a different random resample every epoch. It now visits every val frame exactly once.
 - **Threshold sweep each epoch.** The checkpoint stores `best_threshold`, which the converter uses.
@@ -77,5 +80,5 @@ The script reports:
 - `AIPreprocess.c/.h`: training-exact resize + grayscale + diff (plain C, unit-tested)
 - `convert_to_coreml.py`: checkpoint → `.mlmodel` + `AIPlayerConfig.json`, with parity checks
 - `model_simple.py`, `model_causal.py`: architectures for conversion
-- `tools/`: `test_preprocess.py`, `diagnose.py`
+- `tools/`: `test_preprocess.py`, `diagnose.py`, `label_timing.py`
 - `training/`: fixed loader and trainer, and the patched notebook
